@@ -1,0 +1,582 @@
+"""Main strategy orchestrator: pulls data, evaluates signals, runs lifecycle."""
+
+from __future__ import annotations
+
+import logging
+import signal
+import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
+
+from ..dashboard.text import render_dashboard
+from ..data.polymarket import ClobClient, GammaClient, MarketSnapshot
+from ..data.price_feed import PriceFeed
+from ..execution.router import LiveExecutor, PaperExecutor, make_executor
+from ..hedge.engine import evaluate_hedge
+from ..notifications.telegram import TelegramReporter, build_status_report
+from ..risk.manager import RiskManager
+from ..signals.composite import FeatureSet, evaluate
+from ..storage.journal import CloseTradeRecord, OpenTradeRecord, TradeJournal
+from ..utils.clock import bucket_5m_start, iso_z, now_ts
+from .config import AppConfig
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class OpenPosition:
+    trade_id: str
+    side: str
+    token_id: str
+    entry_price: float
+    shares: float
+    cost_usd: float
+    market_end_ts: float
+    market_slug: str
+    is_hedge: bool = False
+    parent_trade_id: str | None = None
+    opened_ts: float = 0.0
+
+
+class Orchestrator:
+    def __init__(self, cfg: AppConfig) -> None:
+        self.cfg = cfg
+        self.gamma = GammaClient(base_url=cfg.data.gamma_base_url)
+        self.clob = ClobClient(base_url=cfg.data.clob_base_url)
+        self.price_feed = PriceFeed(
+            primary=cfg.data.primary_price_source,
+            fallback=cfg.data.fallback_sources,
+            staleness_max_sec=cfg.data.price_staleness_max_sec,
+        )
+        self.executor: PaperExecutor | LiveExecutor = make_executor(cfg, self.clob)
+        self.risk = RiskManager(cfg.risk)
+        self.journal = TradeJournal(cfg.storage.journal_db)
+        self.session_started_ts = now_ts()
+        self.session_id = self.journal.start_session(cfg.mode, _serialize_cfg(cfg))
+        self.open_positions: dict[str, OpenPosition] = {}
+        self.historical_deltas_pct: deque[float] = deque(maxlen=24)
+        self._stop = False
+        self._installed_signals = False
+        self._last_signal_payload: dict | None = None
+        self.telegram_reporter = TelegramReporter(cfg.telegram)
+        self._last_telegram_report_ts = now_ts()
+
+    def _install_signal_handlers(self) -> None:
+        if self._installed_signals:
+            return
+        try:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            self._installed_signals = True
+        except (ValueError, OSError):  # not in main thread
+            pass
+
+    def _handle_signal(self, signum: int, _frame) -> None:
+        logger.warning("received_signal_%d_initiating_graceful_shutdown", signum)
+        self._stop = True
+
+    def stop(self) -> None:
+        self._stop = True
+
+    # ---------------------- main loop ----------------------
+
+    def run(self) -> None:
+        self._install_signal_handlers()
+        logger.info("orchestrator_starting mode=%s", self.cfg.mode)
+        self._send_startup_telegram_report()
+        try:
+            while not self._stop:
+                try:
+                    self._tick()
+                except Exception as e:
+                    logger.error("tick_error", exc_info=e)
+                self._maybe_send_telegram_report()
+                time.sleep(self.cfg.ops.loop_poll_sec)
+        finally:
+            self._graceful_close_all()
+            self._refresh_dashboard()
+            self.journal.end_session(self.session_id, self.risk.state.equity, notes="graceful_shutdown")
+            logger.info("orchestrator_stopped equity=%.2f", self.risk.state.equity)
+
+    def run_ticks(self, max_ticks: int) -> None:
+        """Run a bounded number of ticks, useful for smoke tests and paper probes."""
+        logger.info("orchestrator_starting_bounded mode=%s max_ticks=%d", self.cfg.mode, max_ticks)
+        self._send_startup_telegram_report()
+        try:
+            for _ in range(max_ticks):
+                if self._stop:
+                    break
+                try:
+                    self._tick()
+                except Exception as e:
+                    logger.error("tick_error", exc_info=e)
+                self._maybe_send_telegram_report()
+                time.sleep(self.cfg.ops.loop_poll_sec)
+        finally:
+            self._graceful_close_all()
+            self._refresh_dashboard()
+            self.journal.end_session(self.session_id, self.risk.state.equity, notes="bounded_run_complete")
+            logger.info("orchestrator_bounded_stopped equity=%.2f", self.risk.state.equity)
+
+    def _tick(self) -> None:
+        market = self.gamma.resolve_current_btc_5m_market(
+            required_resolution_source=self.cfg.data.required_resolution_source
+        )
+        self._refresh_dashboard(market=market)
+        self._manage_positions(market)
+        if market is None:
+            return
+
+        gate = self.risk.can_trade()
+        if not gate.allowed:
+            self._last_signal_payload = {"enter": False, "reason": gate.reason, "features": {}}
+            self._refresh_dashboard(market=market)
+            return
+
+        decision_payload = self._evaluate_signal(market)
+        self._last_signal_payload = decision_payload
+        self._refresh_dashboard(market=market)
+        if not decision_payload["enter"]:
+            return
+
+        reentry_gate = self._can_open_for_market(market, decision_payload)
+        if not reentry_gate["allowed"]:
+            self._last_signal_payload = {**decision_payload, "enter": False, "reason": reentry_gate["reason"]}
+            self._refresh_dashboard(market=market)
+            return
+
+        self._open_position(market, decision_payload)
+
+    def _send_startup_telegram_report(self) -> None:
+        if self.cfg.telegram.send_on_start:
+            self._send_telegram_report(since_ts=self.session_started_ts)
+
+    def _maybe_send_telegram_report(self) -> None:
+        if not self.telegram_reporter.configured:
+            return
+        now = now_ts()
+        if now - self._last_telegram_report_ts < self.cfg.telegram.report_interval_sec:
+            return
+        since_ts = self._last_telegram_report_ts
+        self._send_telegram_report(since_ts=since_ts)
+        self._last_telegram_report_ts = now
+
+    def _send_telegram_report(self, *, since_ts: float | None = None) -> None:
+        if not self.telegram_reporter.configured:
+            return
+        risk_snapshot = self.risk.snapshot()
+        text = build_status_report(
+            mode=self.cfg.mode,
+            equity=self.risk.state.equity,
+            risk=risk_snapshot,
+            total_summary=self.journal.summary(),
+            interval_summary=self.journal.summary(since_ts=since_ts) if since_ts is not None else self.journal.summary(),
+            open_positions=len(self.open_positions),
+            last_signal=self._last_signal_payload,
+        )
+        result = self.telegram_reporter.send_text(text)
+        if result.ok:
+            logger.info("telegram_report_sent")
+        else:
+            logger.warning("telegram_report_not_sent reason=%s", result.reason)
+    def _evaluate_signal(self, market: MarketSnapshot) -> dict:
+        candles_1m = self.price_feed.fetch_candles_1m(n=6)
+        candles_5m = self.price_feed.fetch_candles_5m(n=12)
+        current_btc = self.price_feed.current_price()
+        window_start = _slug_bucket_start(market.slug) or bucket_5m_start()
+        window_open = self.price_feed.window_open_price(window_start)
+        up_book = self.clob.orderbook(market.up_token_id)
+        down_book = self.clob.orderbook(market.down_token_id)
+
+        # In a heavily one-sided book one side may have no ask (everyone is bidding).
+        # We only need OUR-side ask to evaluate entry; the opposite ask is used for skew
+        # and can be defaulted to (1 - opposite_bid) when missing.
+        if current_btc is None or window_open is None:
+            return {
+                "enter": False,
+                "reason": "missing_data",
+                "features": {
+                    "current_btc": current_btc or 0.0,
+                    "window_open": window_open or 0.0,
+                    "up_ask": up_book.best_ask or 0.0,
+                    "down_ask": down_book.best_ask or 0.0,
+                },
+            }
+        if up_book.best_ask is None and down_book.best_ask is None:
+            return {
+                "enter": False,
+                "reason": "no_asks_either_side",
+                "features": {
+                    "current_btc": current_btc,
+                    "window_open": window_open,
+                },
+            }
+
+        # Fill in the missing-side ask from the opposite bid (complementary prob).
+        eff_up_ask = (
+            up_book.best_ask
+            if up_book.best_ask is not None
+            else (round(1.0 - down_book.best_bid, 4) if down_book.best_bid is not None else 0.0)
+        )
+        eff_down_ask = (
+            down_book.best_ask
+            if down_book.best_ask is not None
+            else (round(1.0 - up_book.best_bid, 4) if up_book.best_bid is not None else 0.0)
+        )
+
+        # Compute prior 5m deltas as historical sample for z-score
+        if len(candles_5m) >= 2:
+            for i in range(1, len(candles_5m)):
+                prev_close = candles_5m[i - 1].close
+                cur_close = candles_5m[i].close
+                if prev_close > 0:
+                    self.historical_deltas_pct.append((cur_close - prev_close) / prev_close * 100.0)
+
+        direction_up = current_btc >= window_open
+        side_top_ask_notional_usd = (
+            up_book.top_ask_notional_usd if direction_up else down_book.top_ask_notional_usd
+        )
+
+        features = FeatureSet(
+            current_btc=current_btc,
+            window_open_btc=window_open,
+            closes_1m=tuple(c.close for c in candles_1m),
+            highs_5m=tuple(c.high for c in candles_5m),
+            lows_5m=tuple(c.low for c in candles_5m),
+            closes_5m=tuple(c.close for c in candles_5m),
+            historical_deltas_pct=tuple(self.historical_deltas_pct),
+            seconds_left=market.seconds_left,
+            clob_up_ask=eff_up_ask,
+            clob_down_ask=eff_down_ask,
+            clob_up_bid=up_book.best_bid or 0.0,
+            clob_down_bid=down_book.best_bid or 0.0,
+            top_ask_notional_usd=side_top_ask_notional_usd,
+        )
+
+        decision = evaluate(features, self.cfg.signal)
+        return {
+            "enter": decision.enter,
+            "side": decision.side,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "features": decision.features,
+            "up_ask": up_book.best_ask,
+            "down_ask": down_book.best_ask,
+            "spread": min(
+                up_book.spread if up_book.spread is not None else 0.99,
+                down_book.spread if down_book.spread is not None else 0.99,
+            ),
+        }
+
+    def _open_position(self, market: MarketSnapshot, decision: dict) -> None:
+        side = decision["side"]
+        confidence = float(decision["confidence"])
+        token_id = market.up_token_id if side == "UP" else market.down_token_id
+        book = self.clob.orderbook(token_id)
+        side_ask = book.best_ask
+        if side_ask is None:
+            logger.warning("open_position_failed_no_live_ask side=%s slug=%s", side, market.slug)
+            return
+        side_ask = float(side_ask)
+
+        size_usd = self.risk.size_position(confidence=confidence, side_ask=side_ask)
+        if size_usd <= 0:
+            return
+
+        result = self._submit_buy(token_id=token_id, notional_usd=size_usd)
+        if not result.success:
+            logger.warning("open_position_failed status=%s raw=%s", result.status, result.raw)
+            return
+
+        trade_id = f"trade-{uuid.uuid4().hex[:12]}"
+        pos = OpenPosition(
+            trade_id=trade_id,
+            side=side,
+            token_id=token_id,
+            entry_price=result.filled_price,
+            shares=result.filled_shares,
+            cost_usd=result.cost_usd,
+            market_end_ts=market.end_ts,
+            market_slug=market.slug,
+            opened_ts=now_ts(),
+        )
+        self.open_positions[trade_id] = pos
+        self.risk.record_trade_open()
+        self.journal.record_open(
+            OpenTradeRecord(
+                trade_id=trade_id,
+                mode=self.cfg.mode,
+                market_slug=market.slug,
+                side=side,
+                is_hedge=False,
+                parent_trade_id=None,
+                entry_ts=now_ts(),
+                entry_price=result.filled_price,
+                shares=result.filled_shares,
+                cost_usd=result.cost_usd,
+                confidence=confidence,
+                features=decision.get("features"),
+                extra={"order_id": result.order_id, "ts": iso_z()},
+            )
+        )
+        logger.info(
+            "opened side=%s slug=%s shares=%.4f cost=%.2f confidence=%.3f",
+            side,
+            market.slug,
+            result.filled_shares,
+            result.cost_usd,
+            confidence,
+        )
+
+    def _submit_buy(self, *, token_id: str, notional_usd: float):
+        if isinstance(self.executor, LiveExecutor):
+            book = self.clob.orderbook(token_id)
+            return self.executor.buy(token_id=token_id, notional_usd=notional_usd, snapshot=book)
+        return self.executor.buy(token_id=token_id, notional_usd=notional_usd)
+
+    def _submit_close(self, *, token_id: str, shares: float):
+        if isinstance(self.executor, LiveExecutor):
+            book = self.clob.orderbook(token_id)
+            return self.executor.close(token_id=token_id, shares=shares, snapshot=book)
+        return self.executor.close(token_id=token_id, shares=shares)
+
+    def _manage_positions(self, market: MarketSnapshot | None) -> None:
+        if not self.open_positions:
+            return
+        now = now_ts()
+        for trade_id, pos in list(self.open_positions.items()):
+            seconds_left = max(0.0, pos.market_end_ts - now)
+
+            # Time exit
+            if seconds_left <= 0:
+                if isinstance(self.executor, PaperExecutor) and self.cfg.exit_.paper_settle_on_expiry:
+                    self._settle_paper_position(trade_id)
+                else:
+                    self._close_position(trade_id, reason="expired_force_close")
+                continue
+
+            if seconds_left <= self.cfg.exit_.exit_before_sec:
+                if isinstance(self.executor, PaperExecutor) and self.cfg.exit_.paper_settle_on_expiry:
+                    continue
+                self._close_position(trade_id, reason="time_exit")
+                continue
+
+            # Hedge logic (only for main, not hedges)
+            if market is None:
+                continue
+
+            if not pos.is_hedge and self.cfg.hedge.enabled and pos.market_slug == market.slug:
+                opposite_token = market.down_token_id if pos.side == "UP" else market.up_token_id
+                opposite_book = self.clob.orderbook(opposite_token)
+                opposite_ask = opposite_book.best_ask or 0.0
+                # skew_against_us = how much market backs our side already
+                if pos.side == "UP":
+                    main_ask = self.clob.orderbook(market.up_token_id).best_ask or 0.0
+                else:
+                    main_ask = self.clob.orderbook(market.down_token_id).best_ask or 0.0
+                skew = main_ask  # main_ask near 1 means market is sure
+                hedge = evaluate_hedge(
+                    self.cfg.hedge,
+                    main_side=pos.side,
+                    main_notional_usd=pos.cost_usd,
+                    seconds_left=seconds_left,
+                    opposite_ask=opposite_ask,
+                    skew_against_us=skew,
+                )
+                if (
+                    hedge.place_hedge
+                    and hedge.side is not None
+                    and not _has_hedge_for(self.open_positions, trade_id)
+                ):
+                    res = self._submit_buy(token_id=opposite_token, notional_usd=hedge.notional_usd)
+                    if res.success:
+                        hedge_id = f"hedge-{uuid.uuid4().hex[:12]}"
+                        self.open_positions[hedge_id] = OpenPosition(
+                            trade_id=hedge_id,
+                            side=hedge.side,
+                            token_id=opposite_token,
+                            entry_price=res.filled_price,
+                            shares=res.filled_shares,
+                            cost_usd=res.cost_usd,
+                            market_end_ts=pos.market_end_ts,
+                            market_slug=pos.market_slug,
+                            is_hedge=True,
+                            parent_trade_id=trade_id,
+                            opened_ts=now_ts(),
+                        )
+                        self.risk.record_trade_open()
+                        self.journal.record_open(
+                            OpenTradeRecord(
+                                trade_id=hedge_id,
+                                mode=self.cfg.mode,
+                                market_slug=pos.market_slug,
+                                side=hedge.side,
+                                is_hedge=True,
+                                parent_trade_id=trade_id,
+                                entry_ts=now_ts(),
+                                entry_price=res.filled_price,
+                                shares=res.filled_shares,
+                                cost_usd=res.cost_usd,
+                                confidence=None,
+                                features={"skew": skew, "opposite_ask": opposite_ask},
+                                extra={"reason": hedge.reason, "order_id": res.order_id},
+                            )
+                        )
+                        logger.info(
+                            "hedge_opened parent=%s hedge_side=%s notional=%.2f skew=%.3f",
+                            trade_id,
+                            hedge.side,
+                            hedge.notional_usd,
+                            skew,
+                        )
+
+    def _close_position(self, trade_id: str, *, reason: str) -> None:
+        pos = self.open_positions.get(trade_id)
+        if pos is None:
+            return
+        res = self._submit_close(token_id=pos.token_id, shares=pos.shares)
+        proceeds = res.proceeds_usd if res.success else 0.0
+        pnl = proceeds - pos.cost_usd
+        self.journal.record_close(
+            CloseTradeRecord(
+                trade_id=trade_id,
+                exit_ts=now_ts(),
+                exit_price=res.exit_price,
+                proceeds_usd=proceeds,
+                pnl_usd=pnl,
+                close_reason=reason if res.success else f"{reason}_close_failed",
+                extra={"raw": res.raw},
+            )
+        )
+        self.risk.record_trade_close(pnl)
+        del self.open_positions[trade_id]
+        logger.info("closed trade_id=%s pnl=%.2f reason=%s", trade_id, pnl, reason)
+
+    def _can_open_for_market(self, market: MarketSnapshot, decision: dict) -> dict[str, object]:
+        main_positions = [
+            p for p in self.open_positions.values() if p.market_slug == market.slug and not p.is_hedge
+        ]
+        if not main_positions:
+            return {"allowed": True, "reason": "ok"}
+
+        if not self.cfg.risk.allow_multiple_entries_per_market:
+            return {"allowed": False, "reason": "position_already_open_for_market"}
+
+        if len(main_positions) >= self.cfg.risk.max_entries_per_market:
+            return {"allowed": False, "reason": "max_entries_per_market_hit"}
+
+        side = decision.get("side")
+        if any(p.side != side for p in main_positions):
+            return {"allowed": False, "reason": "opposite_side_position_open"}
+
+        now = now_ts()
+        last_opened_ts = max((p.opened_ts for p in main_positions), default=0.0)
+        elapsed = now - last_opened_ts
+        if elapsed < self.cfg.risk.min_reentry_delay_sec:
+            return {"allowed": False, "reason": f"reentry_delay_{int(self.cfg.risk.min_reentry_delay_sec - elapsed)}s"}
+
+        market_exposure = sum(p.cost_usd for p in main_positions)
+        max_exposure = self.risk.state.equity * (self.cfg.risk.max_market_exposure_pct / 100.0)
+        if market_exposure >= max_exposure:
+            return {"allowed": False, "reason": "max_market_exposure_hit"}
+
+        return {"allowed": True, "reason": "ok"}
+
+    def _settle_paper_position(self, trade_id: str) -> None:
+        pos = self.open_positions.get(trade_id)
+        if pos is None:
+            return
+        final_btc = self.price_feed.current_price()
+        window_start = _slug_bucket_start(pos.market_slug)
+        window_open = self.price_feed.window_open_price(window_start) if window_start is not None else None
+        if final_btc is None or window_open is None:
+            self._close_position(trade_id, reason="paper_settle_missing_resolution_data")
+            return
+
+        winning_side = "UP" if final_btc >= window_open else "DOWN"
+        won = pos.side == winning_side
+        proceeds = round(pos.shares if won else 0.0, 4)
+        pnl = proceeds - pos.cost_usd
+        exit_price = 1.0 if won else 0.0
+        self.journal.record_close(
+            CloseTradeRecord(
+                trade_id=trade_id,
+                exit_ts=now_ts(),
+                exit_price=exit_price,
+                proceeds_usd=proceeds,
+                pnl_usd=pnl,
+                close_reason="paper_settled_won" if won else "paper_settled_lost",
+                extra={"final_btc": final_btc, "window_open_btc": window_open, "winning_side": winning_side},
+            )
+        )
+        self.risk.record_trade_close(pnl)
+        del self.open_positions[trade_id]
+        logger.info("paper_settled trade_id=%s pnl=%.2f winning_side=%s", trade_id, pnl, winning_side)
+
+    def _graceful_close_all(self) -> None:
+        if not self.open_positions:
+            return
+        logger.warning("graceful_close_all n=%d", len(self.open_positions))
+        for trade_id in list(self.open_positions.keys()):
+            try:
+                self._close_position(trade_id, reason="graceful_shutdown")
+            except Exception as e:
+                logger.error("graceful_close_error trade_id=%s", trade_id, exc_info=e)
+
+    def _refresh_dashboard(self, *, market: MarketSnapshot | None = None) -> None:
+        market_payload = None
+        if market is not None:
+            up = self.clob.orderbook(market.up_token_id)
+            dn = self.clob.orderbook(market.down_token_id)
+            market_payload = {
+                "slug": market.slug,
+                "seconds_left": max(0.0, market.end_ts - now_ts()),
+                "up_ask": up.best_ask,
+                "down_ask": dn.best_ask,
+                "spread": min(
+                    up.spread if up.spread is not None else 0.99,
+                    dn.spread if dn.spread is not None else 0.99,
+                ),
+            }
+        render_dashboard(
+            out_path=self.cfg.storage.dashboard_path,
+            mode=self.cfg.mode,
+            market=market_payload,
+            last_signal=self._last_signal_payload,
+            risk=self.risk.snapshot(),
+            journal_summary=self.journal.summary(),
+            extras={"open_positions": len(self.open_positions)},
+        )
+
+
+def _has_hedge_for(positions: dict[str, OpenPosition], parent_trade_id: str) -> bool:
+    return any(p.is_hedge and p.parent_trade_id == parent_trade_id for p in positions.values())
+
+
+def _slug_bucket_start(slug: str) -> int | None:
+    try:
+        return int(slug.rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _serialize_cfg(cfg: AppConfig) -> dict:
+    """Produce a config snapshot for the session row (no secrets)."""
+    import dataclasses
+
+    return {
+        "mode": cfg.mode,
+        "symbol": cfg.symbol,
+        "market_kind": cfg.market_kind,
+        "signal": dataclasses.asdict(cfg.signal),
+        "risk": dataclasses.asdict(cfg.risk),
+        "hedge": dataclasses.asdict(cfg.hedge),
+        "telegram": {
+            "enabled": cfg.telegram.enabled,
+            "chat_id_configured": bool(cfg.telegram.chat_id),
+            "report_interval_sec": cfg.telegram.report_interval_sec,
+            "send_on_start": cfg.telegram.send_on_start,
+        },
+        "exit": dataclasses.asdict(cfg.exit_),
+    }

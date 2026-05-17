@@ -1,0 +1,23 @@
+services:
+  edge-bot:
+    build: .
+    container_name: edge-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUNTIME_DIR=/app/runtime
+      - JOURNAL_DB=/app/runtime/journal.sqlite3
+      - AUDIT_LOG=/app/runtime/audit.jsonl
+      - DASHBOARD_PATH=/app/runtime/dashboard.txt
+    volumes:
+      - ./runtime:/app/runtime
+    ports:
+      - "8080:8080"
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/runtime/dashboard.txt"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

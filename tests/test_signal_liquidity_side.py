@@ -1,0 +1,77 @@
+from edge_bot.core.config import AppConfig, StorageConfig
+from edge_bot.core.orchestrator import Orchestrator
+from edge_bot.data.polymarket import MarketSnapshot, OrderbookSnapshot
+from edge_bot.data.price_feed import Candle
+
+
+class DummyPriceFeed:
+    def fetch_candles_1m(self, n: int = 6) -> list[Candle]:
+        return [
+            Candle(0, 100_000, 100_000, 100_000, 100_000, 0),
+            Candle(60, 100_040, 100_040, 100_040, 100_040, 0),
+            Candle(120, 100_080, 100_080, 100_080, 100_080, 0),
+            Candle(180, 100_110, 100_110, 100_110, 100_110, 0),
+            Candle(240, 100_120, 100_120, 100_120, 100_120, 0),
+        ]
+
+    def fetch_candles_5m(self, n: int = 12) -> list[Candle]:
+        return [Candle(i * 300, 100_000, 100_150, 99_950, 100_020 + i, 0) for i in range(12)]
+
+    def current_price(self) -> float:
+        return 100_120.0
+
+    def window_open_price(self, _window_start: int) -> float:
+        return 100_000.0
+
+
+class DummyClob:
+    def orderbook(self, token_id: str) -> OrderbookSnapshot:
+        if token_id == "up-token":
+            return OrderbookSnapshot(
+                best_bid=0.83,
+                best_ask=0.85,
+                best_bid_size=100.0,
+                best_ask_size=1.0,
+                top_ask_notional_usd=0.85,
+                spread=0.02,
+            )
+        return OrderbookSnapshot(
+            best_bid=0.13,
+            best_ask=0.15,
+            best_bid_size=100.0,
+            best_ask_size=1_000.0,
+            top_ask_notional_usd=150.0,
+            spread=0.02,
+        )
+
+
+def test_signal_uses_liquidity_of_directional_side(tmp_path) -> None:
+    cfg = AppConfig(
+        mode="paper",
+        storage=StorageConfig(
+            runtime_dir=tmp_path,
+            journal_db=tmp_path / "journal.sqlite3",
+            audit_log=tmp_path / "audit.jsonl",
+            dashboard_path=tmp_path / "dashboard.txt",
+        ),
+    )
+    orch = Orchestrator(cfg)
+    orch.price_feed = DummyPriceFeed()  # type: ignore[assignment]
+    orch.clob = DummyClob()  # type: ignore[assignment]
+
+    decision = orch._evaluate_signal(
+        MarketSnapshot(
+            slug="btc-updown-5m-1779036600",
+            end_ts=1_779_036_900,
+            seconds_left=30.0,
+            up_token_id="up-token",
+            down_token_id="down-token",
+            gamma_up_price=0.85,
+            gamma_down_price=0.15,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+        )
+    )
+
+    assert decision["enter"] is False
+    assert "top_ask" in decision["reason"]
+

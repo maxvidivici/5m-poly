@@ -1,0 +1,20 @@
+﻿[Unit]
+Description=BTC 5m Polymarket edge-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edgebot
+Group=edgebot
+WorkingDirectory=/opt/edge-bot
+Environment=PYTHONPATH=/opt/edge-bot/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/edge-bot/.venv/bin/python -m edge_bot.cli run --mode paper
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
