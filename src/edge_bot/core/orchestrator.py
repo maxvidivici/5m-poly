@@ -178,8 +178,16 @@ class Orchestrator:
             mode=self.cfg.mode,
             equity=self.risk.state.equity,
             risk=risk_snapshot,
-            total_summary=self.journal.summary(),
-            interval_summary=self.journal.summary(since_ts=since_ts) if since_ts is not None else self.journal.summary(),
+            total_summary=self.journal.summary(hedge=False),
+            interval_summary=self.journal.summary(since_ts=since_ts, hedge=False)
+            if since_ts is not None
+            else self.journal.summary(hedge=False),
+            total_hedge_summary=self.journal.summary(hedge=True),
+            interval_hedge_summary=self.journal.summary(since_ts=since_ts, hedge=True)
+            if since_ts is not None
+            else self.journal.summary(hedge=True),
+            total_net_summary=self.journal.summary(),
+            interval_net_summary=self.journal.summary(since_ts=since_ts) if since_ts is not None else self.journal.summary(),
             open_positions=len(self.open_positions),
             last_signal=self._last_signal_payload,
             signal_summary=self.journal.signal_summary(since_ts=since_ts),

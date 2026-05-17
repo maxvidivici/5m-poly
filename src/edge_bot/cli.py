@@ -54,6 +54,11 @@ def report(
         console.print(f"[yellow]No journal at {db_path}[/yellow]")
         raise typer.Exit(code=1)
     journal = TradeJournal(db_path)
+    console.print("[bold]Main strategy summary:[/bold]")
+    console.print_json(json.dumps(journal.summary(hedge=False), default=str))
+    console.print("\n[bold]Hedge summary:[/bold]")
+    console.print_json(json.dumps(journal.summary(hedge=True), default=str))
+    console.print("\n[bold]Net summary:[/bold]")
     console.print_json(json.dumps(journal.summary(), default=str))
     console.print(f"\n[bold]Recent {limit} trades:[/bold]")
     for row in journal.list_recent(limit):
@@ -136,8 +141,12 @@ def telegram_test() -> None:
             "hourly_trades": 0,
             "consecutive_losses": 0,
         },
-        total_summary=journal.summary(),
-        interval_summary=journal.summary(),
+        total_summary=journal.summary(hedge=False),
+        interval_summary=journal.summary(hedge=False),
+        total_hedge_summary=journal.summary(hedge=True),
+        interval_hedge_summary=journal.summary(hedge=True),
+        total_net_summary=journal.summary(),
+        interval_net_summary=journal.summary(),
         open_positions=0,
         last_signal={"reason": "manual_telegram_test", "features": {}},
         signal_summary=journal.signal_summary(),

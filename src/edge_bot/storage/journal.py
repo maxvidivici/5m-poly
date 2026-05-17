@@ -365,12 +365,15 @@ class TradeJournal:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def summary(self, *, since_ts: float | None = None) -> dict[str, Any]:
+    def summary(self, *, since_ts: float | None = None, hedge: bool | None = None) -> dict[str, Any]:
         where = "exit_ts IS NOT NULL"
-        params: tuple[float, ...] = ()
+        params: list[float | int] = []
         if since_ts is not None:
             where += " AND exit_ts >= ?"
-            params = (since_ts,)
+            params.append(since_ts)
+        if hedge is not None:
+            where += " AND is_hedge = ?"
+            params.append(1 if hedge else 0)
 
         with self._conn() as cx:
             rows = cx.execute(
@@ -384,7 +387,7 @@ class TradeJournal:
                 FROM trades
                 WHERE {where}
                 """,
-                params,
+                tuple(params),
             ).fetchone()
         return dict(rows) if rows is not None else {}
 

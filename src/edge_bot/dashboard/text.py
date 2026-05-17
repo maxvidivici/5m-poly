@@ -64,7 +64,7 @@ def render_dashboard(
     if journal_summary:
         lines += [
             "",
-            "[journal]",
+            "[journal net]",
             f"  n_trades: {journal_summary.get('n_trades')}",
             f"  wins: {journal_summary.get('wins')}",
             f"  losses: {journal_summary.get('losses')}",

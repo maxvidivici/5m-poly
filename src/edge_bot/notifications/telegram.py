@@ -58,21 +58,27 @@ def build_status_report(
     risk: dict[str, Any],
     total_summary: dict[str, Any],
     interval_summary: dict[str, Any],
+    total_hedge_summary: dict[str, Any] | None = None,
+    interval_hedge_summary: dict[str, Any] | None = None,
+    total_net_summary: dict[str, Any] | None = None,
+    interval_net_summary: dict[str, Any] | None = None,
     open_positions: int,
     last_signal: dict[str, Any] | None,
     signal_summary: dict[str, Any] | None = None,
 ) -> str:
-    total_trades = int(total_summary.get("n_trades") or 0)
-    total_wins = int(total_summary.get("wins") or 0)
-    total_losses = int(total_summary.get("losses") or 0)
-    total_pnl = float(total_summary.get("total_pnl_usd") or 0.0)
-    total_wr = _winrate(total_wins, total_losses)
+    total_hedge_summary = total_hedge_summary or {}
+    interval_hedge_summary = interval_hedge_summary or {}
+    total_net_summary = total_net_summary or total_summary
+    interval_net_summary = interval_net_summary or interval_summary
 
-    interval_trades = int(interval_summary.get("n_trades") or 0)
-    interval_wins = int(interval_summary.get("wins") or 0)
-    interval_losses = int(interval_summary.get("losses") or 0)
-    interval_pnl = float(interval_summary.get("total_pnl_usd") or 0.0)
-    interval_wr = _winrate(interval_wins, interval_losses)
+    total_trades, total_wins, total_losses, total_pnl, total_wr = _summary_parts(total_summary)
+    interval_trades, interval_wins, interval_losses, interval_pnl, interval_wr = _summary_parts(interval_summary)
+    hedge_trades, hedge_wins, hedge_losses, hedge_pnl, hedge_wr = _summary_parts(total_hedge_summary)
+    interval_hedge_trades, interval_hedge_wins, interval_hedge_losses, interval_hedge_pnl, interval_hedge_wr = (
+        _summary_parts(interval_hedge_summary)
+    )
+    _, _, _, total_net_pnl, _ = _summary_parts(total_net_summary)
+    _, _, _, interval_net_pnl, _ = _summary_parts(interval_net_summary)
 
     reason = "n/a"
     side = "n/a"
@@ -101,13 +107,17 @@ def build_status_report(
             f"BTC 5m Polymarket report | {mode.upper()}",
             f"time: {iso_z()}",
             "",
-            "Last interval:",
+            "Last interval main strategy:",
             f"trades: {interval_trades} | wins/losses: {interval_wins}/{interval_losses} | winrate: {interval_wr:.1f}%",
             f"pnl: ${interval_pnl:.2f}",
+            f"hedge: {interval_hedge_trades} trades | wins/losses: {interval_hedge_wins}/{interval_hedge_losses} | winrate: {interval_hedge_wr:.1f}% | pnl: ${interval_hedge_pnl:.2f}",
+            f"net pnl: ${interval_net_pnl:.2f}",
             "",
-            "Total journal:",
+            "Total main strategy:",
             f"trades: {total_trades} | wins/losses: {total_wins}/{total_losses} | winrate: {total_wr:.1f}%",
             f"pnl: ${total_pnl:.2f}",
+            f"hedge: {hedge_trades} trades | wins/losses: {hedge_wins}/{hedge_losses} | winrate: {hedge_wr:.1f}% | pnl: ${hedge_pnl:.2f}",
+            f"net pnl: ${total_net_pnl:.2f}",
             "",
             "Risk:",
             f"equity: ${equity:.2f} | daily pnl: ${float(risk.get('daily_pnl') or 0.0):.2f}",
@@ -128,3 +138,11 @@ def build_status_report(
 def _winrate(wins: int, losses: int) -> float:
     total = wins + losses
     return (wins / total * 100.0) if total > 0 else 0.0
+
+
+def _summary_parts(summary: dict[str, Any]) -> tuple[int, int, int, float, float]:
+    trades = int(summary.get("n_trades") or 0)
+    wins = int(summary.get("wins") or 0)
+    losses = int(summary.get("losses") or 0)
+    pnl = float(summary.get("total_pnl_usd") or 0.0)
+    return trades, wins, losses, pnl, _winrate(wins, losses)
