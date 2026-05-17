@@ -43,8 +43,9 @@ class CloseResult:
 class PaperExecutor:
     """Simulated executor with realistic spread+latency."""
 
-    def __init__(self, clob: ClobClient) -> None:
+    def __init__(self, clob: ClobClient, *, taker_fee_rate: float = 0.0) -> None:
         self.clob = clob
+        self.taker_fee_rate = max(0.0, float(taker_fee_rate))
 
     def buy(self, *, token_id: str, notional_usd: float) -> OrderResult:
         book = self.clob.orderbook(token_id)
@@ -52,10 +53,13 @@ class PaperExecutor:
         if ask <= 0.0:
             return OrderResult(False, "no_ask", None, 0.0, 0.0, 0.0, {"book": book.__dict__})
 
-        # Pessimistic fill: take the ask, deduct half-spread as slippage.
+        # Pessimistic fill: take the ask and include taker fee in the notional budget.
         fill_px = min(0.99, ask)
-        shares = round(notional_usd / fill_px, 4)
-        cost = round(shares * fill_px, 4)
+        fee_per_share = taker_fee_per_share(fill_px, self.taker_fee_rate)
+        shares = round(notional_usd / (fill_px + fee_per_share), 4)
+        gross_cost = shares * fill_px
+        fee = shares * fee_per_share
+        cost = round(gross_cost + fee, 4)
         return OrderResult(
             success=True,
             status="paper_matched",
@@ -63,7 +67,7 @@ class PaperExecutor:
             filled_price=fill_px,
             filled_shares=shares,
             cost_usd=cost,
-            raw={"book_ask": ask, "ts": iso_z()},
+            raw={"book_ask": ask, "gross_cost": round(gross_cost, 4), "fee_usd": round(fee, 4), "ts": iso_z()},
         )
 
     def close(self, *, token_id: str, shares: float) -> CloseResult:
@@ -72,8 +76,16 @@ class PaperExecutor:
         if bid <= 0.0 or shares <= 0.0:
             return CloseResult(False, "no_bid_or_shares", 0.0, 0.0, {"book": book.__dict__})
         exit_px = max(0.01, bid)
-        proceeds = round(shares * exit_px, 4)
-        return CloseResult(True, "paper_matched", proceeds, exit_px, {"book_bid": bid, "ts": iso_z()})
+        gross_proceeds = shares * exit_px
+        fee = shares * taker_fee_per_share(exit_px, self.taker_fee_rate)
+        proceeds = round(max(0.0, gross_proceeds - fee), 4)
+        return CloseResult(
+            True,
+            "paper_matched",
+            proceeds,
+            exit_px,
+            {"book_bid": bid, "gross_proceeds": round(gross_proceeds, 4), "fee_usd": round(fee, 4), "ts": iso_z()},
+        )
 
 
 class LiveExecutor:
@@ -201,4 +213,10 @@ def make_executor(cfg: AppConfig, clob: ClobClient) -> PaperExecutor | LiveExecu
                 "Run paper/backtest first; live mode places real Polymarket orders."
             )
         return LiveExecutor(cfg)
-    return PaperExecutor(clob)
+    taker_fee_rate = cfg.fees.paper_taker_fee_rate if cfg.fees.paper_taker_fees_enabled else 0.0
+    return PaperExecutor(clob, taker_fee_rate=taker_fee_rate)
+
+
+def taker_fee_per_share(price: float, fee_rate: float) -> float:
+    price = max(0.0, min(1.0, float(price)))
+    return max(0.0, float(fee_rate)) * price * (1.0 - price)

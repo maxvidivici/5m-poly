@@ -98,6 +98,7 @@ def dump_config() -> None:
         "signal": dataclasses.asdict(cfg.signal),
         "risk": dataclasses.asdict(cfg.risk),
         "hedge": dataclasses.asdict(cfg.hedge),
+        "fees": dataclasses.asdict(cfg.fees),
         "telegram": {
             "enabled": cfg.telegram.enabled,
             "bot_token_configured": bool(cfg.telegram.bot_token),

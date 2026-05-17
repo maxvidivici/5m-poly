@@ -126,6 +126,12 @@ class HedgeConfig:
 
 
 @dataclass(slots=True)
+class FeeConfig:
+    paper_taker_fees_enabled: bool = True
+    paper_taker_fee_rate: float = 0.07
+
+
+@dataclass(slots=True)
 class ExitConfig:
     stop_loss_pct: float = 0.25
     take_profit_pct: float = 0.20
@@ -175,6 +181,7 @@ class AppConfig:
     signal: SignalConfig = field(default_factory=SignalConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     hedge: HedgeConfig = field(default_factory=HedgeConfig)
+    fees: FeeConfig = field(default_factory=FeeConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     exit_: ExitConfig = field(default_factory=ExitConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -274,6 +281,10 @@ def load_config() -> AppConfig:
             notional_pct_of_main=_envf("HEDGE_NOTIONAL_PCT_OF_MAIN", 3.0),
             notional_usd_min=_envf("HEDGE_NOTIONAL_USD_MIN", 1.0),
             notional_usd_max=_envf("HEDGE_NOTIONAL_USD_MAX", 2.0),
+        ),
+        fees=FeeConfig(
+            paper_taker_fees_enabled=_envb("PAPER_TAKER_FEES_ENABLED", True),
+            paper_taker_fee_rate=_envf("PAPER_TAKER_FEE_RATE", 0.07),
         ),
         exit_=ExitConfig(
             stop_loss_pct=_envf("STOP_LOSS_PCT", 0.25),

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import httpx
 
 from ..core.config import AppConfig
+from ..execution.router import taker_fee_per_share
 from ..risk.manager import RiskManager
 from ..signals.composite import FeatureSet, _delta_thresholds, evaluate
 from ..signals import indicators
@@ -227,7 +228,8 @@ def run_backtest_from_klines(cfg: AppConfig, klines: list[list]) -> BacktestResu
         for entry in entries_this_market:
             ask = float(entry["ask"])
             size = float(entry["size"])
-            shares = size / ask
+            fee_rate = cfg.fees.paper_taker_fee_rate if cfg.fees.paper_taker_fees_enabled else 0.0
+            shares = size / (ask + taker_fee_per_share(ask, fee_rate))
             side = str(entry["side"])
             won = (side == "UP" and final_close >= window_open) or (side == "DOWN" and final_close < window_open)
             pnl = (shares * 1.0 - size) if won else -size

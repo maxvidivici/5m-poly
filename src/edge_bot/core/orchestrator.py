@@ -693,6 +693,7 @@ def _serialize_cfg(cfg: AppConfig) -> dict:
         "signal": dataclasses.asdict(cfg.signal),
         "risk": dataclasses.asdict(cfg.risk),
         "hedge": dataclasses.asdict(cfg.hedge),
+        "fees": dataclasses.asdict(cfg.fees),
         "telegram": {
             "enabled": cfg.telegram.enabled,
             "chat_id_configured": bool(cfg.telegram.chat_id),
