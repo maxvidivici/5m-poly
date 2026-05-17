@@ -17,7 +17,7 @@ from ..hedge.engine import evaluate_hedge
 from ..notifications.telegram import TelegramReporter, build_status_report
 from ..risk.manager import RiskManager
 from ..signals.composite import FeatureSet, evaluate
-from ..storage.journal import CloseTradeRecord, OpenTradeRecord, TradeJournal
+from ..storage.journal import CloseTradeRecord, OpenTradeRecord, SignalObservationRecord, TradeJournal
 from ..utils.clock import bucket_5m_start, iso_z, now_ts
 from .config import AppConfig
 
@@ -56,6 +56,9 @@ class Orchestrator:
         self.session_id = self.journal.start_session(cfg.mode, _serialize_cfg(cfg))
         self.open_positions: dict[str, OpenPosition] = {}
         self.historical_deltas_pct: deque[float] = deque(maxlen=24)
+        self._observed_signal_markets: dict[str, tuple[float, int]] = {}
+        self._settled_signal_markets: set[str] = set()
+        self._load_unsettled_signal_markets()
         self._stop = False
         self._installed_signals = False
         self._last_signal_payload: dict | None = None
@@ -120,6 +123,7 @@ class Orchestrator:
             logger.info("orchestrator_bounded_stopped equity=%.2f", self.risk.state.equity)
 
     def _tick(self) -> None:
+        self._settle_expired_signal_markets()
         market = self.gamma.resolve_current_btc_5m_market(
             required_resolution_source=self.cfg.data.required_resolution_source
         )
@@ -131,6 +135,7 @@ class Orchestrator:
         gate = self.risk.can_trade()
         if not gate.allowed:
             self._last_signal_payload = {"enter": False, "reason": gate.reason, "features": {}}
+            self._record_signal_observation(market, self._last_signal_payload)
             self._refresh_dashboard(market=market)
             return
 
@@ -138,14 +143,17 @@ class Orchestrator:
         self._last_signal_payload = decision_payload
         self._refresh_dashboard(market=market)
         if not decision_payload["enter"]:
+            self._record_signal_observation(market, decision_payload)
             return
 
         reentry_gate = self._can_open_for_market(market, decision_payload)
         if not reentry_gate["allowed"]:
             self._last_signal_payload = {**decision_payload, "enter": False, "reason": reentry_gate["reason"]}
+            self._record_signal_observation(market, self._last_signal_payload)
             self._refresh_dashboard(market=market)
             return
 
+        self._record_signal_observation(market, decision_payload)
         self._open_position(market, decision_payload)
 
     def _send_startup_telegram_report(self) -> None:
@@ -174,6 +182,7 @@ class Orchestrator:
             interval_summary=self.journal.summary(since_ts=since_ts) if since_ts is not None else self.journal.summary(),
             open_positions=len(self.open_positions),
             last_signal=self._last_signal_payload,
+            signal_summary=self.journal.signal_summary(since_ts=since_ts),
         )
         result = self.telegram_reporter.send_text(text)
         if result.ok:
@@ -199,8 +208,11 @@ class Orchestrator:
                 "features": {
                     "current_btc": current_btc or 0.0,
                     "window_open": window_open or 0.0,
+                    "window_open_btc": window_open or 0.0,
                     "up_ask": up_book.best_ask or 0.0,
                     "down_ask": down_book.best_ask or 0.0,
+                    "up_bid": up_book.best_bid or 0.0,
+                    "down_bid": down_book.best_bid or 0.0,
                 },
             }
         if up_book.best_ask is None and down_book.best_ask is None:
@@ -210,6 +222,9 @@ class Orchestrator:
                 "features": {
                     "current_btc": current_btc,
                     "window_open": window_open,
+                    "window_open_btc": window_open,
+                    "up_bid": up_book.best_bid or 0.0,
+                    "down_bid": down_book.best_bid or 0.0,
                 },
             }
 
@@ -255,19 +270,100 @@ class Orchestrator:
         )
 
         decision = evaluate(features, self.cfg.signal)
+        decision_features = {
+            **decision.features,
+            "current_btc": current_btc,
+            "window_open_btc": window_open,
+            "seconds_left": market.seconds_left,
+            "up_ask": up_book.best_ask or 0.0,
+            "down_ask": down_book.best_ask or 0.0,
+            "up_bid": up_book.best_bid or 0.0,
+            "down_bid": down_book.best_bid or 0.0,
+            "top_ask_notional_usd": side_top_ask_notional_usd,
+        }
         return {
             "enter": decision.enter,
             "side": decision.side,
             "confidence": decision.confidence,
             "reason": decision.reason,
-            "features": decision.features,
+            "features": decision_features,
             "up_ask": up_book.best_ask,
             "down_ask": down_book.best_ask,
+            "up_bid": up_book.best_bid,
+            "down_bid": down_book.best_bid,
+            "top_ask_notional_usd": side_top_ask_notional_usd,
             "spread": min(
                 up_book.spread if up_book.spread is not None else 0.99,
                 down_book.spread if down_book.spread is not None else 0.99,
             ),
         }
+
+    def _record_signal_observation(self, market: MarketSnapshot, decision: dict) -> None:
+        window_start = _slug_bucket_start(market.slug) or bucket_5m_start()
+        self._observed_signal_markets[market.slug] = (market.end_ts, window_start)
+        features = decision.get("features") or {}
+        try:
+            self.journal.record_signal_observation(
+                SignalObservationRecord(
+                    ts=now_ts(),
+                    market_slug=market.slug,
+                    market_end_ts=market.end_ts,
+                    seconds_left=max(0.0, market.end_ts - now_ts()),
+                    enter=bool(decision.get("enter")),
+                    side=decision.get("side"),
+                    confidence=_optional_float(decision.get("confidence")),
+                    reason=str(decision.get("reason") or "unknown"),
+                    current_btc=_optional_float(features.get("current_btc")),
+                    window_open_btc=_optional_float(features.get("window_open_btc", features.get("window_open"))),
+                    delta_usd=_optional_float(features.get("delta_usd")),
+                    delta_pct=_optional_float(features.get("delta_pct")),
+                    up_ask=_optional_float(decision.get("up_ask", features.get("up_ask"))),
+                    down_ask=_optional_float(decision.get("down_ask", features.get("down_ask"))),
+                    up_bid=_optional_float(decision.get("up_bid", features.get("up_bid"))),
+                    down_bid=_optional_float(decision.get("down_bid", features.get("down_bid"))),
+                    spread=_optional_float(decision.get("spread", features.get("spread"))),
+                    top_ask_notional_usd=_optional_float(
+                        decision.get("top_ask_notional_usd", features.get("top_ask_notional_usd"))
+                    ),
+                    features=features,
+                )
+            )
+        except Exception as e:
+            logger.warning("signal_observation_record_failed", exc_info=e)
+
+    def _settle_expired_signal_markets(self) -> None:
+        if not self._observed_signal_markets:
+            return
+        now = now_ts()
+        for slug, (end_ts, window_start) in list(self._observed_signal_markets.items()):
+            if slug in self._settled_signal_markets or now < end_ts:
+                continue
+            final_btc = self.price_feed.current_price()
+            window_open = self.price_feed.window_open_price(window_start)
+            if final_btc is None or window_open is None:
+                continue
+            updated = self.journal.settle_signal_observations(
+                market_slug=slug,
+                final_btc=final_btc,
+                window_open_btc=window_open,
+                settled_ts=now,
+            )
+            self._settled_signal_markets.add(slug)
+            self._observed_signal_markets.pop(slug, None)
+            logger.info("signal_observations_settled slug=%s updated=%d", slug, updated)
+
+    def _load_unsettled_signal_markets(self) -> None:
+        try:
+            rows = self.journal.unsettled_signal_markets()
+        except Exception as e:
+            logger.warning("load_unsettled_signal_markets_failed", exc_info=e)
+            return
+        for row in rows:
+            slug = str(row.get("market_slug") or "")
+            window_start = _slug_bucket_start(slug)
+            if window_start is None:
+                continue
+            self._observed_signal_markets[slug] = (float(row.get("market_end_ts") or 0.0), window_start)
 
     def _open_position(self, market: MarketSnapshot, decision: dict) -> None:
         side = decision["side"]
@@ -557,6 +653,15 @@ def _has_hedge_for(positions: dict[str, OpenPosition], parent_trade_id: str) -> 
 def _slug_bucket_start(slug: str) -> int | None:
     try:
         return int(slug.rsplit("-", 1)[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 

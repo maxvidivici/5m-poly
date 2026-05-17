@@ -60,6 +60,28 @@ def report(
         console.print_json(json.dumps(row, default=str))
 
 
+@app.command("signal-report")
+def signal_report(
+    limit: int = typer.Option(20, "--limit", help="Number of rows to show per section"),
+    db: Path = typer.Option(None, "--db", help="Path to journal SQLite db"),
+) -> None:
+    """Analyze all observed entry/skip points, including profitable misses."""
+    cfg = load_config()
+    db_path = db or cfg.storage.journal_db
+    if not db_path.exists():
+        console.print(f"[yellow]No journal at {db_path}[/yellow]")
+        raise typer.Exit(code=1)
+    journal = TradeJournal(db_path)
+    console.print("[bold]Signal observation summary:[/bold]")
+    console.print_json(json.dumps(journal.signal_summary(), default=str))
+    console.print(f"\n[bold]Top {limit} skip/entry reasons:[/bold]")
+    for row in journal.signal_reason_counts(limit=limit):
+        console.print_json(json.dumps(row, default=str))
+    console.print(f"\n[bold]Top {limit} profitable skipped observations:[/bold]")
+    for row in journal.list_profitable_skipped_observations(limit=limit):
+        console.print_json(json.dumps(row, default=str))
+
+
 @app.command()
 def dump_config() -> None:
     """Print the resolved configuration (without auth secrets)."""
@@ -118,6 +140,7 @@ def telegram_test() -> None:
         interval_summary=journal.summary(),
         open_positions=0,
         last_signal={"reason": "manual_telegram_test", "features": {}},
+        signal_summary=journal.signal_summary(),
     )
     result = reporter.send_text(text)
     if not result.ok:

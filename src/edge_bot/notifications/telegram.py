@@ -60,6 +60,7 @@ def build_status_report(
     interval_summary: dict[str, Any],
     open_positions: int,
     last_signal: dict[str, Any] | None,
+    signal_summary: dict[str, Any] | None = None,
 ) -> str:
     total_trades = int(total_summary.get("n_trades") or 0)
     total_wins = int(total_summary.get("wins") or 0)
@@ -89,6 +90,12 @@ def build_status_report(
             hard = float(features.get("delta_hard_min_usd") or 0.0)
             soft = float(features.get("delta_soft_min_usd") or 0.0)
 
+    signal_summary = signal_summary or {}
+    observations = int(signal_summary.get("observations") or 0)
+    markets_seen = int(signal_summary.get("markets_seen") or 0)
+    entry_signals = int(signal_summary.get("entry_signals") or 0)
+    profitable_skips = int(signal_summary.get("profitable_skipped_observations") or 0)
+
     return "\n".join(
         [
             f"BTC 5m Polymarket report | {mode.upper()}",
@@ -110,6 +117,10 @@ def build_status_report(
             "Last signal:",
             f"side: {side} | confidence: {confidence:.3f} | reason: {reason}",
             f"delta: ${delta:.1f} | soft/hard: ${soft:.0f}/${hard:.0f}",
+            "",
+            "Signal log:",
+            f"observations: {observations} | markets: {markets_seen} | entry signals: {entry_signals}",
+            f"profitable skipped observations: {profitable_skips}",
         ]
     )
 
