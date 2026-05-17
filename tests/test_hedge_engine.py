@@ -10,7 +10,7 @@ def test_hedge_triggered_at_extreme_skew_near_close() -> None:
     d = evaluate_hedge(
         cfg(),
         main_side="UP",
-        main_notional_usd=20.0,
+        main_notional_usd=50.0,
         seconds_left=20.0,
         opposite_ask=0.06,
         skew_against_us=0.96,
@@ -24,7 +24,7 @@ def test_hedge_blocked_too_early() -> None:
     d = evaluate_hedge(
         cfg(),
         main_side="UP",
-        main_notional_usd=20.0,
+        main_notional_usd=50.0,
         seconds_left=120.0,
         opposite_ask=0.06,
         skew_against_us=0.96,
@@ -36,7 +36,7 @@ def test_hedge_blocked_skew_normal() -> None:
     d = evaluate_hedge(
         cfg(),
         main_side="UP",
-        main_notional_usd=20.0,
+        main_notional_usd=50.0,
         seconds_left=20.0,
         opposite_ask=0.30,
         skew_against_us=0.70,
@@ -50,3 +50,16 @@ def test_hedge_disabled() -> None:
         c, main_side="UP", main_notional_usd=20.0, seconds_left=20.0, opposite_ask=0.06, skew_against_us=0.96
     )
     assert d.place_hedge is False
+
+
+def test_hedge_blocked_when_main_position_is_too_small() -> None:
+    d = evaluate_hedge(
+        cfg(),
+        main_side="UP",
+        main_notional_usd=3.0,
+        seconds_left=20.0,
+        opposite_ask=0.06,
+        skew_against_us=0.96,
+    )
+    assert d.place_hedge is False
+    assert "below_hedge_min" in d.reason

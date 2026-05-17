@@ -30,10 +30,20 @@ def evaluate_hedge(
     Logic:
     * Skew on our side must be >= skew_trigger (market is 'too sure').
     * Time remaining must be <= seconds_left_max (only near close).
+    * Main position must be large enough; a $1 hedge destroys small entries.
     * Hedge notional = pct_of_main of main, clamped to [min, max] USD caps.
     """
     if not cfg.enabled:
         return HedgeDecision(False, None, 0.0, 0.0, "hedge_disabled")
+
+    if main_notional_usd < cfg.min_main_notional_usd:
+        return HedgeDecision(
+            False,
+            None,
+            0.0,
+            0.0,
+            f"main_notional_${main_notional_usd:.2f}_below_hedge_min_${cfg.min_main_notional_usd:.2f}",
+        )
 
     if seconds_left > cfg.seconds_left_max:
         return HedgeDecision(False, None, 0.0, 0.0, "too_early_to_hedge")

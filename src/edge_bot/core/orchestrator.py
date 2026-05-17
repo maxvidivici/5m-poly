@@ -484,6 +484,10 @@ class Orchestrator:
                     hedge.place_hedge
                     and hedge.side is not None
                     and not _has_hedge_for(self.open_positions, trade_id)
+                    and not (
+                        self.cfg.hedge.once_per_market
+                        and _has_hedge_for_market(self.open_positions, pos.market_slug)
+                    )
                 ):
                     res = self._submit_buy(token_id=opposite_token, notional_usd=hedge.notional_usd)
                     if res.success:
@@ -648,6 +652,10 @@ class Orchestrator:
 
 def _has_hedge_for(positions: dict[str, OpenPosition], parent_trade_id: str) -> bool:
     return any(p.is_hedge and p.parent_trade_id == parent_trade_id for p in positions.values())
+
+
+def _has_hedge_for_market(positions: dict[str, OpenPosition], market_slug: str) -> bool:
+    return any(p.is_hedge and p.market_slug == market_slug for p in positions.values())
 
 
 def _slug_bucket_start(slug: str) -> int | None:

@@ -118,6 +118,8 @@ class HedgeConfig:
     enabled: bool = True
     skew_trigger: float = 0.95
     seconds_left_max: float = 30.0
+    min_main_notional_usd: float = 25.0
+    once_per_market: bool = True
     notional_pct_of_main: float = 3.0
     notional_usd_min: float = 1.0
     notional_usd_max: float = 2.0
@@ -267,6 +269,8 @@ def load_config() -> AppConfig:
             enabled=_envb("HEDGE_ENABLED", True),
             skew_trigger=_envf("HEDGE_SKEW_TRIGGER", 0.95),
             seconds_left_max=_envf("HEDGE_SECONDS_LEFT_MAX", 30.0),
+            min_main_notional_usd=_envf("HEDGE_MIN_MAIN_NOTIONAL_USD", 25.0),
+            once_per_market=_envb("HEDGE_ONCE_PER_MARKET", True),
             notional_pct_of_main=_envf("HEDGE_NOTIONAL_PCT_OF_MAIN", 3.0),
             notional_usd_min=_envf("HEDGE_NOTIONAL_USD_MIN", 1.0),
             notional_usd_max=_envf("HEDGE_NOTIONAL_USD_MAX", 2.0),
