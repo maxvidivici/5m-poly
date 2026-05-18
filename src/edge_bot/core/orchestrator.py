@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from ..analysis.regime import regime_tags_from_features
 from ..dashboard.text import render_dashboard
-from ..data.polymarket import ClobClient, GammaClient, MarketSnapshot, OrderbookLevel, OrderbookSnapshot
+from ..data.polymarket import ClobClient, ClobWsObserver, ClobWsTop, GammaClient, MarketSnapshot, OrderbookLevel, OrderbookSnapshot
 from ..data.price_feed import PriceFeed
 from ..execution.fill_sim import simulate_buy_fill
 from ..execution.router import LiveExecutor, PaperExecutor, make_executor
@@ -53,6 +53,7 @@ class Orchestrator:
         self.cfg = cfg
         self.gamma = GammaClient(base_url=cfg.data.gamma_base_url)
         self.clob = ClobClient(base_url=cfg.data.clob_base_url)
+        self.clob_ws = ClobWsObserver(ws_url=cfg.data.clob_ws_url, enabled=cfg.data.clob_ws_enabled)
         self.price_feed = PriceFeed(
             primary=cfg.data.primary_price_source,
             fallback=cfg.data.fallback_sources,
@@ -107,6 +108,7 @@ class Orchestrator:
                 time.sleep(self.cfg.ops.loop_poll_sec)
         finally:
             self._graceful_close_all()
+            self.clob_ws.close()
             self._refresh_dashboard()
             self.journal.end_session(self.session_id, self.risk.state.equity, notes="graceful_shutdown")
             logger.info("orchestrator_stopped equity=%.2f", self.risk.state.equity)
@@ -127,6 +129,7 @@ class Orchestrator:
                 time.sleep(self.cfg.ops.loop_poll_sec)
         finally:
             self._graceful_close_all()
+            self.clob_ws.close()
             self._refresh_dashboard()
             self.journal.end_session(self.session_id, self.risk.state.equity, notes="bounded_run_complete")
             logger.info("orchestrator_bounded_stopped equity=%.2f", self.risk.state.equity)
@@ -219,8 +222,18 @@ class Orchestrator:
         current_btc = self.price_feed.current_price()
         window_start = _slug_bucket_start(market.slug) or bucket_5m_start()
         window_open = self.price_feed.window_open_price(window_start)
+        self.clob_ws.subscribe((market.up_token_id, market.down_token_id))
         up_book = self.clob.orderbook(market.up_token_id)
         down_book = self.clob.orderbook(market.down_token_id)
+        ws_up = self.clob_ws.snapshot(market.up_token_id)
+        ws_down = self.clob_ws.snapshot(market.down_token_id)
+        ws_features = _clob_ws_feature_dump(
+            enabled=self.cfg.data.clob_ws_enabled,
+            up_ws=ws_up,
+            down_ws=ws_down,
+            up_http=up_book,
+            down_http=down_book,
+        )
 
         # In a heavily one-sided book one side may have no ask (everyone is bidding).
         # We only need OUR-side ask to evaluate entry; the opposite ask is used for skew
@@ -237,6 +250,7 @@ class Orchestrator:
                     "down_ask": down_book.best_ask or 0.0,
                     "up_bid": up_book.best_bid or 0.0,
                     "down_bid": down_book.best_bid or 0.0,
+                    **ws_features,
                 },
             }
         if up_book.best_ask is None and down_book.best_ask is None:
@@ -249,6 +263,7 @@ class Orchestrator:
                     "window_open_btc": window_open,
                     "up_bid": up_book.best_bid or 0.0,
                     "down_bid": down_book.best_bid or 0.0,
+                    **ws_features,
                 },
             }
 
@@ -273,6 +288,8 @@ class Orchestrator:
                     self.historical_deltas_pct.append((cur_close - prev_close) / prev_close * 100.0)
 
         direction_up = current_btc >= window_open
+        side_label = "UP" if direction_up else "DOWN"
+        ws_features.update(_clob_ws_side_features(side_label, ws_up, ws_down, up_book, down_book))
         side_top_ask_notional_usd = (
             up_book.top_ask_notional_usd if direction_up else down_book.top_ask_notional_usd
         )
@@ -304,6 +321,7 @@ class Orchestrator:
             "up_bid": up_book.best_bid or 0.0,
             "down_bid": down_book.best_bid or 0.0,
             "top_ask_notional_usd": side_top_ask_notional_usd,
+            **ws_features,
         }
         return {
             "enter": decision.enter,
@@ -878,6 +896,66 @@ def _feature_float(features: dict, key: str, default: float) -> float:
         return float(default if value is None else value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _clob_ws_feature_dump(
+    *,
+    enabled: bool,
+    up_ws: ClobWsTop | None,
+    down_ws: ClobWsTop | None,
+    up_http: OrderbookSnapshot,
+    down_http: OrderbookSnapshot,
+) -> dict[str, object]:
+    data: dict[str, object] = {"clob_ws_enabled": 1.0 if enabled else 0.0}
+    data.update(_clob_ws_top_features("clob_ws_up", up_ws, up_http))
+    data.update(_clob_ws_top_features("clob_ws_down", down_ws, down_http))
+    return data
+
+
+def _clob_ws_side_features(
+    side_label: str | None,
+    up_ws: ClobWsTop | None,
+    down_ws: ClobWsTop | None,
+    up_http: OrderbookSnapshot,
+    down_http: OrderbookSnapshot,
+) -> dict[str, object]:
+    if side_label == "UP":
+        side_ws, side_http = up_ws, up_http
+        opposite_ws, opposite_http = down_ws, down_http
+    else:
+        side_ws, side_http = down_ws, down_http
+        opposite_ws, opposite_http = up_ws, up_http
+    data = {"clob_ws_side_label": side_label or ""}
+    data.update(_clob_ws_top_features("clob_ws_side", side_ws, side_http))
+    data.update(_clob_ws_top_features("clob_ws_opposite", opposite_ws, opposite_http))
+    return data
+
+
+def _clob_ws_top_features(prefix: str, ws_top: ClobWsTop | None, http_book: OrderbookSnapshot) -> dict[str, object]:
+    if ws_top is None:
+        return {f"{prefix}_seen": 0.0}
+    return {
+        f"{prefix}_seen": 1.0,
+        f"{prefix}_bid": ws_top.best_bid,
+        f"{prefix}_ask": ws_top.best_ask,
+        f"{prefix}_bid_size": ws_top.best_bid_size,
+        f"{prefix}_ask_size": ws_top.best_ask_size,
+        f"{prefix}_spread": ws_top.spread,
+        f"{prefix}_top_ask_notional_usd": ws_top.top_ask_notional_usd,
+        f"{prefix}_age_sec": round(ws_top.age_sec, 3),
+        f"{prefix}_event_type": ws_top.event_type,
+        f"{prefix}_exchange_ts": ws_top.exchange_ts,
+        f"{prefix}_received_ts": ws_top.received_ts,
+        f"{prefix}_ask_diff_vs_rest": _clob_ws_diff(ws_top.best_ask, http_book.best_ask),
+        f"{prefix}_bid_diff_vs_rest": _clob_ws_diff(ws_top.best_bid, http_book.best_bid),
+    }
+
+
+def _clob_ws_diff(ws_value: float | None, rest_value: float | None) -> float | None:
+    if ws_value is None or rest_value is None:
+        return None
+    return round(float(ws_value) - float(rest_value), 4)
+
 
 def _optional_float(value) -> float | None:
     try:

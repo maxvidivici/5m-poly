@@ -76,6 +76,8 @@ class DataConfig:
     price_staleness_max_sec: float = 4.0
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    clob_ws_enabled: bool = False
     required_resolution_source: str = "chainlink"
 
 
@@ -255,6 +257,8 @@ def load_config() -> AppConfig:
             price_staleness_max_sec=_envf("PRICE_STALENESS_MAX_SEC", 4.0),
             gamma_base_url=_env("GAMMA_BASE_URL", "https://gamma-api.polymarket.com"),
             clob_base_url=_env("PM_CLOB_BASE", "https://clob.polymarket.com"),
+            clob_ws_url=_env("PM_CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+            clob_ws_enabled=_envb("PM_CLOB_WS_ENABLED", False),
             required_resolution_source=_env("REQUIRED_RESOLUTION_SOURCE", "chainlink").lower(),
         ),
         signal=SignalConfig(

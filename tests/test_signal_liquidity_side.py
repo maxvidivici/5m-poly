@@ -1,6 +1,6 @@
-from edge_bot.core.config import AppConfig, StorageConfig
+from edge_bot.core.config import AppConfig, DataConfig, StorageConfig
 from edge_bot.core.orchestrator import Orchestrator
-from edge_bot.data.polymarket import MarketSnapshot, OrderbookSnapshot
+from edge_bot.data.polymarket import ClobWsTop, MarketSnapshot, OrderbookSnapshot
 from edge_bot.data.price_feed import Candle
 
 
@@ -74,4 +74,69 @@ def test_signal_uses_liquidity_of_directional_side(tmp_path) -> None:
 
     assert decision["enter"] is False
     assert "top_ask" in decision["reason"]
+
+
+class DummyClobWs:
+    def __init__(self) -> None:
+        self.subscribed: tuple[str, ...] = ()
+        self.tops = {
+            "up-token": ClobWsTop(
+                asset_id="up-token",
+                best_bid=0.88,
+                best_ask=0.90,
+                best_bid_size=1_000.0,
+                best_ask_size=1_000.0,
+                top_ask_notional_usd=900.0,
+                spread=0.02,
+                event_type="price_change",
+                exchange_ts=1_779_036_800.0,
+                received_ts=1_779_036_800.0,
+            )
+        }
+
+    def subscribe(self, asset_ids: tuple[str, ...]) -> None:
+        self.subscribed = asset_ids
+
+    def snapshot(self, asset_id: str) -> ClobWsTop | None:
+        return self.tops.get(asset_id)
+
+    def close(self) -> None:
+        pass
+
+
+def test_clob_ws_fields_are_observation_only(tmp_path) -> None:
+    cfg = AppConfig(
+        mode="paper",
+        data=DataConfig(clob_ws_enabled=True),
+        storage=StorageConfig(
+            runtime_dir=tmp_path,
+            journal_db=tmp_path / "journal.sqlite3",
+            audit_log=tmp_path / "audit.jsonl",
+            dashboard_path=tmp_path / "dashboard.txt",
+        ),
+    )
+    orch = Orchestrator(cfg)
+    orch.price_feed = DummyPriceFeed()  # type: ignore[assignment]
+    orch.clob = DummyClob()  # type: ignore[assignment]
+    orch.clob_ws = DummyClobWs()  # type: ignore[assignment]
+
+    decision = orch._evaluate_signal(
+        MarketSnapshot(
+            slug="btc-updown-5m-1779036600",
+            end_ts=1_779_036_900,
+            seconds_left=30.0,
+            up_token_id="up-token",
+            down_token_id="down-token",
+            gamma_up_price=0.85,
+            gamma_down_price=0.15,
+            resolution_source="https://data.chain.link/streams/btc-usd",
+        )
+    )
+
+    assert decision["enter"] is False
+    assert "top_ask" in decision["reason"]
+    assert decision["features"]["up_ask"] == 0.85
+    assert decision["features"]["clob_ws_up_seen"] == 1.0
+    assert decision["features"]["clob_ws_side_ask"] == 0.90
+    assert decision["features"]["clob_ws_side_ask_diff_vs_rest"] == 0.05
 
