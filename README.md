@@ -35,6 +35,7 @@ Report:
 ```powershell
 $env:PYTHONPATH='src'
 python -m edge_bot.cli report --limit 20
+python -m edge_bot.cli fill-report --limit 20
 Get-Content runtime\dashboard.txt
 ```
 
@@ -61,6 +62,10 @@ $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 $env:PYTHONPATH='src'
 python -m pytest -q
 ```
+
+## Live Preparation
+
+See [LIVE_READINESS.md](LIVE_READINESS.md) for the live-fill, liquidity-aware sizing, slippage and regime-analysis plan.
 
 ## Live Trading Gate
 

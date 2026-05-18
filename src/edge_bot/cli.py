@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 import dataclasses
 import datetime as dt
 import json
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
 
+from .analysis.regime import bucket_trade_features, regime_tags_from_features
 from .backtest.engine import fetch_btc_1m_klines, run_backtest, run_backtest_from_klines
 from .core.config import load_config
 from .core.orchestrator import Orchestrator
@@ -87,6 +90,68 @@ def signal_report(
     console.print(f"\n[bold]Top {limit} profitable skipped observations:[/bold]")
     for row in journal.list_profitable_skipped_observations(limit=limit):
         console.print_json(json.dumps(row, default=str))
+
+
+@app.command("fill-report")
+def fill_report(
+    limit: int = typer.Option(20, "--limit", help="Number of recent fill simulation rows to show"),
+    db: Path = typer.Option(None, "--db", help="Path to journal SQLite db"),
+) -> None:
+    """Analyze orderbook-depth fill simulations and market regime distribution."""
+    cfg = load_config()
+    db_path = db or cfg.storage.journal_db
+    if not db_path.exists():
+        console.print(f"[yellow]No journal at {db_path}[/yellow]")
+        raise typer.Exit(code=1)
+    journal = TradeJournal(db_path)
+
+    console.print("[bold]Fill simulation summary by target:[/bold]")
+    for row in journal.fill_simulation_summary(
+        hedge=False,
+        min_fill_ratio=cfg.live_readiness.min_fill_ratio,
+    ):
+        console.print_json(json.dumps(row, default=str))
+
+    console.print(f"\n[bold]Recent {limit} fill simulation rows:[/bold]")
+    for row in journal.list_recent_fill_simulations(limit=limit, hedge=False):
+        console.print_json(json.dumps(row, default=str))
+
+    trades = journal.list_trade_analysis(hedge=False)
+    console.print("\n[bold]PnL by regime tag:[/bold]")
+    for row in _summarize_regime_tags(trades, cfg.signal):
+        console.print_json(json.dumps(row, default=str))
+
+    sections = (
+        ("PnL by side", lambda row, _features: str(row.get("side") or "unknown")),
+        (
+            "PnL by delta bucket",
+            lambda _row, features: bucket_trade_features(features).get("delta_bucket", "unknown")
+            if features
+            else "unknown",
+        ),
+        (
+            "PnL by ask bucket",
+            lambda _row, features: bucket_trade_features(features).get("ask_bucket", "unknown")
+            if features
+            else "unknown",
+        ),
+        (
+            "PnL by seconds_left bucket",
+            lambda _row, features: bucket_trade_features(features).get("seconds_left_bucket", "unknown")
+            if features
+            else "unknown",
+        ),
+        (
+            "PnL by liquidity bucket",
+            lambda _row, features: bucket_trade_features(features).get("liquidity_bucket", "unknown")
+            if features
+            else "unknown",
+        ),
+    )
+    for title, label_fn in sections:
+        console.print(f"\n[bold]{title}:[/bold]")
+        for row in _summarize_trade_groups(trades, label_fn):
+            console.print_json(json.dumps(row, default=str))
 
 
 @app.command("reconcile-official")
@@ -217,6 +282,7 @@ def dump_config() -> None:
         "risk": dataclasses.asdict(cfg.risk),
         "hedge": dataclasses.asdict(cfg.hedge),
         "fees": dataclasses.asdict(cfg.fees),
+        "live_readiness": dataclasses.asdict(cfg.live_readiness),
         "telegram": {
             "enabled": cfg.telegram.enabled,
             "bot_token_configured": bool(cfg.telegram.bot_token),
@@ -343,6 +409,84 @@ def optimize(
                         )
     rows.sort(key=lambda r: (float(r["total_pnl"]), int(r["n_trades"])), reverse=True)
     console.print_json(json.dumps(rows[:top], default=str))
+
+
+def _summarize_regime_tags(trades: list[dict[str, Any]], signal_cfg: object) -> list[dict[str, Any]]:
+    def labels(row: dict[str, Any], features: dict[str, Any]) -> list[str]:
+        raw_tags = features.get("regime_tags")
+        if isinstance(raw_tags, list) and raw_tags:
+            return [str(tag) for tag in raw_tags]
+        if not features:
+            return ["unknown"]
+        return regime_tags_from_features(features, signal_cfg)
+
+    return _summarize_multi_groups(trades, labels)
+
+
+def _summarize_trade_groups(trades: list[dict[str, Any]], label_fn) -> list[dict[str, Any]]:
+    return _summarize_multi_groups(trades, lambda row, features: [label_fn(row, features)])
+
+
+def _summarize_multi_groups(trades: list[dict[str, Any]], labels_fn) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "trades": 0,
+            "official_settled": 0,
+            "wins": 0,
+            "losses": 0,
+            "pnl_usd": 0.0,
+        }
+    )
+    for row in trades:
+        features = _features(row)
+        labels = labels_fn(row, features)
+        for label in labels:
+            key = str(label or "unknown")
+            item = groups[key]
+            item["trades"] += 1
+            pnl = row.get("pnl_usd")
+            if pnl is None:
+                continue
+            pnl_v = _float(pnl)
+            item["official_settled"] += 1
+            item["pnl_usd"] += pnl_v
+            if pnl_v > 0:
+                item["wins"] += 1
+            else:
+                item["losses"] += 1
+
+    result: list[dict[str, Any]] = []
+    for label, item in groups.items():
+        settled = int(item["official_settled"])
+        wins = int(item["wins"])
+        result.append(
+            {
+                "group": label,
+                "trades": int(item["trades"]),
+                "official_settled": settled,
+                "wins": wins,
+                "losses": int(item["losses"]),
+                "winrate_pct": round((wins / settled * 100.0), 2) if settled else 0.0,
+                "pnl_usd": round(float(item["pnl_usd"]), 4),
+            }
+        )
+    result.sort(key=lambda r: (int(r["trades"]), float(r["pnl_usd"])), reverse=True)
+    return result
+
+
+def _features(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        raw = json.loads(str(row.get("features_json") or "{}"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 if __name__ == "__main__":

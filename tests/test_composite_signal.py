@@ -84,7 +84,21 @@ def test_rsi_extreme_is_soft_bonus_not_hard_block() -> None:
     assert d.features["rsi_score"] == 0.0
 
 
-def test_atr_overheat_is_soft_confidence_penalty_not_hard_block() -> None:
+def test_atr_overheat_is_soft_confidence_penalty_when_hard_block_disabled() -> None:
+    feats = baseline_features(
+        highs_5m=(100200.0, 100250.0, 100300.0, 100280.0, 100900.0),
+        lows_5m=(99900.0, 100000.0, 100100.0, 100150.0, 99900.0),
+        closes_5m=(100100.0, 100150.0, 100200.0, 100200.0, 100120.0),
+    )
+
+    d = evaluate(feats, SignalConfig(atr_hard_block_enabled=False))
+
+    assert d.enter is True
+    assert d.features["atr_score"] < 1.0
+    assert "range" not in d.reason
+
+
+def test_atr_hard_block_rejects_extreme_volatility() -> None:
     feats = baseline_features(
         highs_5m=(100200.0, 100250.0, 100300.0, 100280.0, 100900.0),
         lows_5m=(99900.0, 100000.0, 100100.0, 100150.0, 99900.0),
@@ -93,9 +107,9 @@ def test_atr_overheat_is_soft_confidence_penalty_not_hard_block() -> None:
 
     d = evaluate(feats, cfg())
 
-    assert d.enter is True
-    assert d.features["atr_score"] < 1.0
-    assert "range" not in d.reason
+    assert d.enter is False
+    assert d.features["atr_pct"] >= cfg().atr_hard_block_pct
+    assert "atr_pct" in d.reason
 
 
 def test_down_direction_entry() -> None:

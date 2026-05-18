@@ -11,7 +11,7 @@ On top of the original strategy we layer:
 
   * Z-score soft penalty when delta is statistically overheated.
   * RSI normal-range bonus, never a hard block.
-  * ATR regime/overheat score inside composite confidence.
+  * ATR regime/overheat score inside composite confidence, with an optional hard block.
   * Micro-momentum bonus (last 2x 1m candles confirm).
   * Market-consensus guard (never bet AGAINST very confident markets).
   * Confidence is mapped to an estimated win probability for Kelly sizing.
@@ -159,7 +159,8 @@ def evaluate(features: FeatureSet, cfg: SignalConfig) -> CompositeDecision:
     feat_dump["rsi"] = rsi_v
     feat_dump["rsi_score"] = rsi_score
 
-    # 9. ATR regime and overheat score. This is not a standalone entry blocker.
+    # 9. ATR regime and overheat score. Extreme volatility is blocked because
+    # 5m Polymarket outcomes can reverse across the open line very quickly.
     current_range = 0.0
     if atr_v > 0.0 and len(features.highs_5m) >= 1 and len(features.lows_5m) >= 1:
         current_range = abs(features.highs_5m[-1] - features.lows_5m[-1])
@@ -168,6 +169,15 @@ def evaluate(features: FeatureSet, cfg: SignalConfig) -> CompositeDecision:
     feat_dump["current_range"] = current_range
     feat_dump["atr_pct"] = atr_pct
     feat_dump["atr_score"] = atr_score
+    feat_dump["atr_hard_block_pct"] = cfg.atr_hard_block_pct
+    if cfg.atr_hard_block_enabled and atr_pct >= cfg.atr_hard_block_pct:
+        return CompositeDecision(
+            False,
+            side_label,
+            0.0,
+            f"atr_pct_{atr_pct:.3f}_above_hard_{cfg.atr_hard_block_pct:.3f}",
+            feat_dump,
+        )
 
     # 10. Micro-momentum bonus
     momentum_ok = indicators.micro_momentum_aligned(features.closes_1m, direction_up)

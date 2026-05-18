@@ -9,15 +9,24 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 
+from ..analysis.regime import regime_tags_from_features
 from ..dashboard.text import render_dashboard
-from ..data.polymarket import ClobClient, GammaClient, MarketSnapshot
+from ..data.polymarket import ClobClient, GammaClient, MarketSnapshot, OrderbookLevel, OrderbookSnapshot
 from ..data.price_feed import PriceFeed
+from ..execution.fill_sim import simulate_buy_fill
 from ..execution.router import LiveExecutor, PaperExecutor, make_executor
 from ..hedge.engine import evaluate_hedge
 from ..notifications.telegram import TelegramReporter, build_status_report
 from ..risk.manager import RiskManager
 from ..signals.composite import FeatureSet, evaluate
-from ..storage.journal import CloseTradeRecord, OpenTradeRecord, SignalObservationRecord, TradeJournal
+from ..storage.journal import (
+    CloseTradeRecord,
+    FillSimulationRecord,
+    OpenTradeRecord,
+    OrderbookSnapshotRecord,
+    SignalObservationRecord,
+    TradeJournal,
+)
 from ..utils.clock import bucket_5m_start, iso_z, now_ts
 from .config import AppConfig
 
@@ -394,12 +403,15 @@ class Orchestrator:
         if size_usd <= 0:
             return
 
-        result = self._submit_buy(token_id=token_id, notional_usd=size_usd)
+        result = self._submit_buy(token_id=token_id, notional_usd=size_usd, snapshot=book)
         if not result.success:
             logger.warning("open_position_failed status=%s raw=%s", result.status, result.raw)
             return
 
         trade_id = f"trade-{uuid.uuid4().hex[:12]}"
+        opened_ts = now_ts()
+        features = dict(decision.get("features") or {})
+        features["regime_tags"] = regime_tags_from_features(features, self.cfg.signal)
         pos = OpenPosition(
             trade_id=trade_id,
             side=side,
@@ -409,7 +421,7 @@ class Orchestrator:
             cost_usd=result.cost_usd,
             market_end_ts=market.end_ts,
             market_slug=market.slug,
-            opened_ts=now_ts(),
+            opened_ts=opened_ts,
         )
         self.open_positions[trade_id] = pos
         self.risk.record_trade_open()
@@ -421,14 +433,22 @@ class Orchestrator:
                 side=side,
                 is_hedge=False,
                 parent_trade_id=None,
-                entry_ts=now_ts(),
+                entry_ts=opened_ts,
                 entry_price=result.filled_price,
                 shares=result.filled_shares,
                 cost_usd=result.cost_usd,
                 confidence=confidence,
-                features=decision.get("features"),
+                features=features,
                 extra={"order_id": result.order_id, "ts": iso_z()},
             )
+        )
+        self._record_entry_liquidity_analysis(
+            trade_id=trade_id,
+            ts=opened_ts,
+            market=market,
+            side=side,
+            token_id=token_id,
+            book=book,
         )
         logger.info(
             "opened side=%s slug=%s shares=%.4f cost=%.2f confidence=%.3f",
@@ -439,11 +459,87 @@ class Orchestrator:
             confidence,
         )
 
-    def _submit_buy(self, *, token_id: str, notional_usd: float):
+    def _submit_buy(
+        self,
+        *,
+        token_id: str,
+        notional_usd: float,
+        snapshot: OrderbookSnapshot | None = None,
+    ):
         if isinstance(self.executor, LiveExecutor):
-            book = self.clob.orderbook(token_id)
+            book = snapshot or self.clob.orderbook(token_id)
             return self.executor.buy(token_id=token_id, notional_usd=notional_usd, snapshot=book)
-        return self.executor.buy(token_id=token_id, notional_usd=notional_usd)
+        return self.executor.buy(token_id=token_id, notional_usd=notional_usd, snapshot=snapshot)
+
+    def _record_entry_liquidity_analysis(
+        self,
+        *,
+        trade_id: str,
+        ts: float,
+        market: MarketSnapshot,
+        side: str,
+        token_id: str,
+        book: OrderbookSnapshot,
+    ) -> None:
+        try:
+            level_limit = max(1, int(self.cfg.live_readiness.orderbook_snapshot_levels))
+            asks = tuple(book.asks[:level_limit])
+            bids = tuple(book.bids[:level_limit])
+            self.journal.record_orderbook_snapshot(
+                OrderbookSnapshotRecord(
+                    trade_id=trade_id,
+                    ts=ts,
+                    market_slug=market.slug,
+                    side=side,
+                    token_id=token_id,
+                    best_bid=book.best_bid,
+                    best_ask=book.best_ask,
+                    best_bid_size=book.best_bid_size,
+                    best_ask_size=book.best_ask_size,
+                    top_ask_notional_usd=book.top_ask_notional_usd,
+                    spread=book.spread,
+                    bids=_levels_to_json(bids),
+                    asks=_levels_to_json(asks),
+                )
+            )
+            if book.best_ask is None:
+                return
+
+            max_level_price = min(
+                self.cfg.signal.clob_ask_max,
+                float(book.best_ask) + max(0.0, self.cfg.live_readiness.max_fill_slippage),
+            )
+            max_avg_fill_price = self.cfg.live_readiness.max_avg_fill_price
+            fee_rate = self.cfg.fees.paper_taker_fee_rate if self.cfg.fees.paper_taker_fees_enabled else 0.0
+            for target in self.cfg.live_readiness.fill_sim_targets_usd:
+                sim = simulate_buy_fill(
+                    asks,
+                    target_notional_usd=target,
+                    max_level_price=max_level_price,
+                    fee_rate=fee_rate,
+                    max_avg_fill_price=max_avg_fill_price,
+                )
+                self.journal.record_fill_simulation(
+                    FillSimulationRecord(
+                        trade_id=trade_id,
+                        target_notional_usd=sim.target_notional_usd,
+                        fillable=sim.fillable,
+                        fill_ratio=sim.fill_ratio,
+                        actual_notional_usd=sim.actual_notional_usd,
+                        gross_notional_usd=sim.gross_notional_usd,
+                        best_ask=sim.best_ask,
+                        weighted_avg_fill_price=sim.weighted_avg_fill_price,
+                        max_level_price_used=sim.max_level_price_used,
+                        slippage_from_best_ask=sim.slippage_from_best_ask,
+                        estimated_fee_usd=sim.estimated_fee_usd,
+                        estimated_shares=sim.estimated_shares,
+                        pnl_if_won=sim.pnl_if_won,
+                        pnl_if_lost=sim.pnl_if_lost,
+                        levels_used=[level.as_dict() for level in sim.levels_used],
+                    )
+                )
+        except Exception as e:
+            logger.warning("entry_liquidity_analysis_failed trade_id=%s", trade_id, exc_info=e)
 
     def _submit_close(self, *, token_id: str, shares: float):
         if isinstance(self.executor, LiveExecutor):
@@ -677,6 +773,17 @@ class Orchestrator:
         )
 
 
+def _levels_to_json(levels: tuple[OrderbookLevel, ...]) -> list[dict[str, float]]:
+    return [
+        {
+            "price": round(level.price, 4),
+            "size": round(level.size, 4),
+            "notional_usd": round(level.notional_usd, 4),
+        }
+        for level in levels
+    ]
+
+
 def _has_hedge_for(positions: dict[str, OpenPosition], parent_trade_id: str) -> bool:
     return any(p.is_hedge and p.parent_trade_id == parent_trade_id for p in positions.values())
 
@@ -713,6 +820,7 @@ def _serialize_cfg(cfg: AppConfig) -> dict:
         "risk": dataclasses.asdict(cfg.risk),
         "hedge": dataclasses.asdict(cfg.hedge),
         "fees": dataclasses.asdict(cfg.fees),
+        "live_readiness": dataclasses.asdict(cfg.live_readiness),
         "telegram": {
             "enabled": cfg.telegram.enabled,
             "chat_id_configured": bool(cfg.telegram.chat_id),

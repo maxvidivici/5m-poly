@@ -42,6 +42,16 @@ class MarketResolution:
 
 
 @dataclass(slots=True)
+class OrderbookLevel:
+    price: float
+    size: float
+
+    @property
+    def notional_usd(self) -> float:
+        return self.price * self.size
+
+
+@dataclass(slots=True)
 class OrderbookSnapshot:
     best_bid: float | None
     best_ask: float | None
@@ -49,6 +59,8 @@ class OrderbookSnapshot:
     best_ask_size: float
     top_ask_notional_usd: float
     spread: float | None
+    bids: tuple[OrderbookLevel, ...] = ()
+    asks: tuple[OrderbookLevel, ...] = ()
 
 
 def _parse_jsonish(v: Any) -> list[Any]:
@@ -81,6 +93,23 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_book_levels(rows: list[Any], *, reverse: bool) -> tuple[OrderbookLevel, ...]:
+    levels: list[OrderbookLevel] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            price = float(row.get("price", 0) or 0)
+            size = float(row.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0.0 or size <= 0.0:
+            continue
+        levels.append(OrderbookLevel(price=price, size=size))
+    levels.sort(key=lambda level: level.price, reverse=reverse)
+    return tuple(levels)
 
 
 class GammaClient:
@@ -249,30 +278,12 @@ class ClobClient:
             logger.warning("clob_book_error", exc_info=e)
             return OrderbookSnapshot(None, None, 0.0, 0.0, 0.0, None)
 
-        bids = data.get("bids") or []
-        asks = data.get("asks") or []
-        best_bid: float | None = None
-        best_bid_size = 0.0
-        best_ask: float | None = None
-        best_ask_size = 0.0
-        for b in bids:
-            try:
-                p = float(b.get("price", 0) or 0)
-                s = float(b.get("size", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if best_bid is None or p > best_bid:
-                best_bid = p
-                best_bid_size = s
-        for a in asks:
-            try:
-                p = float(a.get("price", 0) or 0)
-                s = float(a.get("size", 0) or 0)
-            except (TypeError, ValueError):
-                continue
-            if best_ask is None or p < best_ask:
-                best_ask = p
-                best_ask_size = s
+        bids = _parse_book_levels(data.get("bids") or [], reverse=True)
+        asks = _parse_book_levels(data.get("asks") or [], reverse=False)
+        best_bid = bids[0].price if bids else None
+        best_bid_size = bids[0].size if bids else 0.0
+        best_ask = asks[0].price if asks else None
+        best_ask_size = asks[0].size if asks else 0.0
 
         spread = None
         if best_bid is not None and best_ask is not None:
@@ -286,4 +297,6 @@ class ClobClient:
             best_ask_size=best_ask_size,
             top_ask_notional_usd=top_ask_notional,
             spread=spread,
+            bids=bids,
+            asks=asks,
         )

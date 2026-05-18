@@ -78,6 +78,50 @@ CREATE INDEX IF NOT EXISTS idx_signal_obs_ts ON signal_observations(ts);
 CREATE INDEX IF NOT EXISTS idx_signal_obs_market_slug ON signal_observations(market_slug);
 CREATE INDEX IF NOT EXISTS idx_signal_obs_reason ON signal_observations(reason);
 CREATE INDEX IF NOT EXISTS idx_signal_obs_enter ON signal_observations(enter);
+
+CREATE TABLE IF NOT EXISTS orderbook_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL UNIQUE,
+    ts REAL NOT NULL,
+    market_slug TEXT NOT NULL,
+    side TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    best_bid REAL,
+    best_ask REAL,
+    best_bid_size REAL,
+    best_ask_size REAL,
+    top_ask_notional_usd REAL,
+    spread REAL,
+    bids_json TEXT NOT NULL,
+    asks_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orderbook_snapshots_trade_id ON orderbook_snapshots(trade_id);
+CREATE INDEX IF NOT EXISTS idx_orderbook_snapshots_market_slug ON orderbook_snapshots(market_slug);
+
+CREATE TABLE IF NOT EXISTS trade_fill_simulations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL,
+    target_notional_usd REAL NOT NULL,
+    fillable INTEGER NOT NULL DEFAULT 0,
+    fill_ratio REAL NOT NULL DEFAULT 0.0,
+    actual_notional_usd REAL NOT NULL DEFAULT 0.0,
+    gross_notional_usd REAL NOT NULL DEFAULT 0.0,
+    best_ask REAL,
+    weighted_avg_fill_price REAL,
+    max_level_price_used REAL,
+    slippage_from_best_ask REAL,
+    estimated_fee_usd REAL NOT NULL DEFAULT 0.0,
+    estimated_shares REAL NOT NULL DEFAULT 0.0,
+    pnl_if_won REAL NOT NULL DEFAULT 0.0,
+    pnl_if_lost REAL NOT NULL DEFAULT 0.0,
+    levels_used_json TEXT NOT NULL,
+    created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+    UNIQUE(trade_id, target_notional_usd)
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_fill_sims_trade_id ON trade_fill_simulations(trade_id);
+CREATE INDEX IF NOT EXISTS idx_trade_fill_sims_target ON trade_fill_simulations(target_notional_usd);
 """
 
 
@@ -130,6 +174,42 @@ class SignalObservationRecord:
     spread: float | None
     top_ask_notional_usd: float | None
     features: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class OrderbookSnapshotRecord:
+    trade_id: str
+    ts: float
+    market_slug: str
+    side: str
+    token_id: str
+    best_bid: float | None
+    best_ask: float | None
+    best_bid_size: float
+    best_ask_size: float
+    top_ask_notional_usd: float
+    spread: float | None
+    bids: list[dict[str, float]]
+    asks: list[dict[str, float]]
+
+
+@dataclass(slots=True)
+class FillSimulationRecord:
+    trade_id: str
+    target_notional_usd: float
+    fillable: bool
+    fill_ratio: float
+    actual_notional_usd: float
+    gross_notional_usd: float
+    best_ask: float | None
+    weighted_avg_fill_price: float | None
+    max_level_price_used: float | None
+    slippage_from_best_ask: float | None
+    estimated_fee_usd: float
+    estimated_shares: float
+    pnl_if_won: float
+    pnl_if_lost: float
+    levels_used: list[dict[str, float]]
 
 
 class TradeJournal:
@@ -243,6 +323,64 @@ class TradeJournal:
                     rec.spread,
                     rec.top_ask_notional_usd,
                     json.dumps(rec.features or {}, default=str),
+                ),
+            )
+
+    def record_orderbook_snapshot(self, rec: OrderbookSnapshotRecord) -> None:
+        with self._conn() as cx:
+            cx.execute(
+                """
+                INSERT OR REPLACE INTO orderbook_snapshots (
+                    trade_id, ts, market_slug, side, token_id,
+                    best_bid, best_ask, best_bid_size, best_ask_size,
+                    top_ask_notional_usd, spread, bids_json, asks_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec.trade_id,
+                    rec.ts,
+                    rec.market_slug,
+                    rec.side,
+                    rec.token_id,
+                    rec.best_bid,
+                    rec.best_ask,
+                    rec.best_bid_size,
+                    rec.best_ask_size,
+                    rec.top_ask_notional_usd,
+                    rec.spread,
+                    json.dumps(rec.bids, default=str),
+                    json.dumps(rec.asks, default=str),
+                ),
+            )
+
+    def record_fill_simulation(self, rec: FillSimulationRecord) -> None:
+        with self._conn() as cx:
+            cx.execute(
+                """
+                INSERT OR REPLACE INTO trade_fill_simulations (
+                    trade_id, target_notional_usd, fillable, fill_ratio,
+                    actual_notional_usd, gross_notional_usd, best_ask,
+                    weighted_avg_fill_price, max_level_price_used,
+                    slippage_from_best_ask, estimated_fee_usd, estimated_shares,
+                    pnl_if_won, pnl_if_lost, levels_used_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec.trade_id,
+                    rec.target_notional_usd,
+                    1 if rec.fillable else 0,
+                    rec.fill_ratio,
+                    rec.actual_notional_usd,
+                    rec.gross_notional_usd,
+                    rec.best_ask,
+                    rec.weighted_avg_fill_price,
+                    rec.max_level_price_used,
+                    rec.slippage_from_best_ask,
+                    rec.estimated_fee_usd,
+                    rec.estimated_shares,
+                    rec.pnl_if_won,
+                    rec.pnl_if_lost,
+                    json.dumps(rec.levels_used, default=str),
                 ),
             )
 
@@ -450,6 +588,78 @@ class TradeJournal:
                 "SELECT * FROM trades WHERE mode = ? ORDER BY entry_ts ASC",
                 (mode,),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    def fill_simulation_summary(
+        self,
+        *,
+        hedge: bool = False,
+        min_fill_ratio: float | None = None,
+    ) -> list[dict[str, Any]]:
+        min_ratio = 1.0 if min_fill_ratio is None else max(0.0, float(min_fill_ratio))
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT
+                    f.target_notional_usd,
+                    COUNT(*) AS trades,
+                    COALESCE(SUM(f.fillable), 0) AS fully_fillable,
+                    ROUND(100.0 * COALESCE(SUM(f.fillable), 0) / COUNT(*), 2) AS fully_fillable_pct,
+                    COALESCE(SUM(CASE WHEN f.fill_ratio >= ? THEN 1 ELSE 0 END), 0) AS min_ratio_fillable,
+                    ROUND(100.0 * COALESCE(SUM(CASE WHEN f.fill_ratio >= ? THEN 1 ELSE 0 END), 0) / COUNT(*), 2) AS min_ratio_fillable_pct,
+                    ROUND(AVG(f.fill_ratio), 4) AS avg_fill_ratio,
+                    ROUND(AVG(f.actual_notional_usd), 4) AS avg_actual_notional_usd,
+                    ROUND(AVG(f.gross_notional_usd), 4) AS avg_gross_notional_usd,
+                    ROUND(AVG(f.weighted_avg_fill_price), 6) AS avg_fill_price,
+                    ROUND(AVG(f.slippage_from_best_ask), 6) AS avg_slippage_from_best_ask,
+                    COALESCE(SUM(CASE WHEN t.close_reason = 'official_settled_won' THEN 1 ELSE 0 END), 0) AS official_wins,
+                    COALESCE(SUM(CASE WHEN t.close_reason = 'official_settled_lost' THEN 1 ELSE 0 END), 0) AS official_losses,
+                    COALESCE(SUM(CASE WHEN t.close_reason LIKE 'official_settled_%' THEN 1 ELSE 0 END), 0) AS official_settled,
+                    ROUND(COALESCE(SUM(CASE
+                        WHEN t.close_reason = 'official_settled_won' THEN f.pnl_if_won
+                        WHEN t.close_reason = 'official_settled_lost' THEN f.pnl_if_lost
+                        ELSE 0.0
+                    END), 0.0), 4) AS official_simulated_pnl_usd
+                FROM trade_fill_simulations f
+                JOIN trades t ON t.trade_id = f.trade_id
+                WHERE t.is_hedge = ?
+                GROUP BY f.target_notional_usd
+                ORDER BY f.target_notional_usd ASC
+                """,
+                (min_ratio, min_ratio, 1 if hedge else 0),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_recent_fill_simulations(self, limit: int = 20, *, hedge: bool = False) -> list[dict[str, Any]]:
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT
+                    t.entry_ts, t.market_slug, t.side, t.entry_price, t.cost_usd,
+                    t.close_reason, t.pnl_usd,
+                    f.target_notional_usd, f.fillable, f.fill_ratio,
+                    f.actual_notional_usd, f.gross_notional_usd, f.best_ask,
+                    f.weighted_avg_fill_price, f.max_level_price_used,
+                    f.slippage_from_best_ask, f.estimated_fee_usd,
+                    f.estimated_shares, f.pnl_if_won, f.pnl_if_lost
+                FROM trade_fill_simulations f
+                JOIN trades t ON t.trade_id = f.trade_id
+                WHERE t.is_hedge = ?
+                ORDER BY t.entry_ts DESC, f.target_notional_usd ASC
+                LIMIT ?
+                """,
+                (1 if hedge else 0, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_trade_analysis(self, *, hedge: bool = False, limit: int = 0) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM trades WHERE is_hedge = ? ORDER BY entry_ts DESC"
+        params: tuple[Any, ...] = (1 if hedge else 0,)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params = (1 if hedge else 0, limit)
+        with self._conn() as cx:
+            rows = cx.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def summary(self, *, since_ts: float | None = None, hedge: bool | None = None) -> dict[str, Any]:

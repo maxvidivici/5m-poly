@@ -35,6 +35,20 @@ def _envb(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on", "y"}
 
 
+def _env_float_tuple(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = _env(name, ",".join(str(x) for x in default))
+    vals: list[float] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            vals.append(float(item))
+        except ValueError:
+            continue
+    return tuple(vals) if vals else default
+
+
 @dataclass(slots=True)
 class PolymarketAuth:
     private_key: str = ""
@@ -85,6 +99,8 @@ class SignalConfig:
     atr_score_min_pct: float = 0.06
     atr_score_max_pct: float = 0.22
     atr_score_high_pct: float = 0.35
+    atr_hard_block_enabled: bool = True
+    atr_hard_block_pct: float = 0.30
     rsi_max: float = 78.0
     rsi_min: float = 22.0
     atr_overheat_mult: float = 1.6
@@ -144,6 +160,15 @@ class ExitConfig:
 
 
 @dataclass(slots=True)
+class LiveReadinessConfig:
+    fill_sim_targets_usd: tuple[float, ...] = (10.0, 25.0, 50.0, 100.0)
+    orderbook_snapshot_levels: int = 10
+    max_fill_slippage: float = 0.02
+    min_fill_ratio: float = 0.50
+    max_avg_fill_price: float = 0.92
+
+
+@dataclass(slots=True)
 class TelegramConfig:
     enabled: bool = False
     bot_token: str = ""
@@ -182,6 +207,7 @@ class AppConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     hedge: HedgeConfig = field(default_factory=HedgeConfig)
     fees: FeeConfig = field(default_factory=FeeConfig)
+    live_readiness: LiveReadinessConfig = field(default_factory=LiveReadinessConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     exit_: ExitConfig = field(default_factory=ExitConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -239,6 +265,8 @@ def load_config() -> AppConfig:
             atr_score_min_pct=_envf("ATR_SCORE_MIN_PCT", 0.06),
             atr_score_max_pct=_envf("ATR_SCORE_MAX_PCT", 0.22),
             atr_score_high_pct=_envf("ATR_SCORE_HIGH_PCT", 0.35),
+            atr_hard_block_enabled=_envb("ATR_HARD_BLOCK_ENABLED", True),
+            atr_hard_block_pct=_envf("ATR_HARD_BLOCK_PCT", 0.30),
             rsi_max=_envf("RSI_MAX", 78.0),
             rsi_min=_envf("RSI_MIN", 22.0),
             atr_overheat_mult=_envf("ATR_OVERHEAT_MULT", 1.6),
@@ -285,6 +313,13 @@ def load_config() -> AppConfig:
         fees=FeeConfig(
             paper_taker_fees_enabled=_envb("PAPER_TAKER_FEES_ENABLED", True),
             paper_taker_fee_rate=_envf("PAPER_TAKER_FEE_RATE", 0.07),
+        ),
+        live_readiness=LiveReadinessConfig(
+            fill_sim_targets_usd=_env_float_tuple("FILL_SIM_TARGETS_USD", (10.0, 25.0, 50.0, 100.0)),
+            orderbook_snapshot_levels=max(1, _envi("ORDERBOOK_SNAPSHOT_LEVELS", 10)),
+            max_fill_slippage=_envf("LIVE_MAX_FILL_SLIPPAGE", 0.02),
+            min_fill_ratio=_envf("LIVE_MIN_FILL_RATIO", 0.50),
+            max_avg_fill_price=_envf("LIVE_MAX_AVG_FILL_PRICE", 0.92),
         ),
         exit_=ExitConfig(
             stop_loss_pct=_envf("STOP_LOSS_PCT", 0.25),

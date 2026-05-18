@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 from typing import Any
 
@@ -47,11 +47,11 @@ class PaperExecutor:
         self.clob = clob
         self.taker_fee_rate = max(0.0, float(taker_fee_rate))
 
-    def buy(self, *, token_id: str, notional_usd: float) -> OrderResult:
-        book = self.clob.orderbook(token_id)
+    def buy(self, *, token_id: str, notional_usd: float, snapshot: OrderbookSnapshot | None = None) -> OrderResult:
+        book = snapshot or self.clob.orderbook(token_id)
         ask = book.best_ask or 0.0
         if ask <= 0.0:
-            return OrderResult(False, "no_ask", None, 0.0, 0.0, 0.0, {"book": book.__dict__})
+            return OrderResult(False, "no_ask", None, 0.0, 0.0, 0.0, {"book": asdict(book)})
 
         # Pessimistic fill: take the ask and include taker fee in the notional budget.
         fill_px = min(0.99, ask)
@@ -74,7 +74,7 @@ class PaperExecutor:
         book = self.clob.orderbook(token_id)
         bid = book.best_bid or 0.0
         if bid <= 0.0 or shares <= 0.0:
-            return CloseResult(False, "no_bid_or_shares", 0.0, 0.0, {"book": book.__dict__})
+            return CloseResult(False, "no_bid_or_shares", 0.0, 0.0, {"book": asdict(book)})
         exit_px = max(0.01, bid)
         gross_proceeds = shares * exit_px
         fee = shares * taker_fee_per_share(exit_px, self.taker_fee_rate)
