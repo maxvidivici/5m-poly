@@ -112,6 +112,55 @@ def test_atr_hard_block_rejects_extreme_volatility() -> None:
     assert "atr_pct" in d.reason
 
 
+def test_high_vol_edge_guard_blocks_weak_statistical_move() -> None:
+    feats = baseline_features(
+        current_btc=99920.0,
+        window_open_btc=100000.0,
+        closes_1m=(100000.0, 99970.0, 99940.0, 99925.0, 99920.0),
+        highs_5m=(100260.0, 100280.0, 100300.0, 100290.0, 100280.0),
+        lows_5m=(100020.0, 100040.0, 100060.0, 100050.0, 100040.0),
+        closes_5m=(100100.0, 100120.0, 100110.0, 100105.0, 99920.0),
+        historical_deltas_pct=(-0.12, -0.07, -0.10, -0.06, -0.11, -0.08, -0.09, -0.07, -0.10, -0.08),
+        clob_up_ask=0.31,
+        clob_down_ask=0.76,
+        clob_up_bid=0.30,
+        clob_down_bid=0.75,
+        seconds_left=68.0,
+    )
+
+    d = evaluate(feats, cfg())
+
+    assert d.enter is False
+    assert d.features["atr_pct"] >= cfg().high_vol_edge_guard_atr_pct
+    assert d.features["delta_strong_ratio"] < cfg().high_vol_min_delta_strong_ratio
+    assert abs(d.features["zscore"]) < cfg().high_vol_min_abs_zscore
+    assert "high_vol_weak_edge" in d.reason
+
+
+def test_high_vol_edge_guard_allows_significant_zscore_move() -> None:
+    feats = baseline_features(
+        current_btc=99925.0,
+        window_open_btc=100000.0,
+        closes_1m=(100000.0, 99975.0, 99950.0, 99935.0, 99925.0),
+        highs_5m=(100260.0, 100280.0, 100300.0, 100290.0, 100280.0),
+        lows_5m=(100020.0, 100040.0, 100060.0, 100050.0, 100040.0),
+        closes_5m=(100100.0, 100120.0, 100110.0, 100105.0, 99925.0),
+        historical_deltas_pct=(-0.02, -0.04, -0.03, -0.05, -0.04, -0.03, -0.02, -0.04, -0.03, -0.05),
+        clob_up_ask=0.20,
+        clob_down_ask=0.81,
+        clob_up_bid=0.19,
+        clob_down_bid=0.80,
+        seconds_left=92.0,
+    )
+
+    d = evaluate(feats, cfg())
+
+    assert d.enter is True
+    assert d.features["atr_pct"] >= cfg().high_vol_edge_guard_atr_pct
+    assert d.features["delta_strong_ratio"] < cfg().high_vol_min_delta_strong_ratio
+    assert abs(d.features["zscore"]) >= cfg().high_vol_min_abs_zscore
+
+
 def test_down_direction_entry() -> None:
     feats = baseline_features(
         current_btc=99880.0,

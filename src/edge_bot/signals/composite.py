@@ -179,6 +179,26 @@ def evaluate(features: FeatureSet, cfg: SignalConfig) -> CompositeDecision:
             feat_dump,
         )
 
+    delta_strong_ratio = abs_delta_usd / max(delta_strong, 1e-6)
+    feat_dump["delta_strong_ratio"] = delta_strong_ratio
+    feat_dump["high_vol_edge_guard_atr_pct"] = cfg.high_vol_edge_guard_atr_pct
+    feat_dump["high_vol_min_delta_strong_ratio"] = cfg.high_vol_min_delta_strong_ratio
+    feat_dump["high_vol_min_abs_zscore"] = cfg.high_vol_min_abs_zscore
+    if (
+        cfg.high_vol_edge_guard_enabled
+        and atr_pct >= cfg.high_vol_edge_guard_atr_pct
+        and delta_strong_ratio < cfg.high_vol_min_delta_strong_ratio
+        and abs(z) < cfg.high_vol_min_abs_zscore
+    ):
+        return CompositeDecision(
+            False,
+            side_label,
+            0.0,
+            "high_vol_weak_edge_"
+            f"atr_{atr_pct:.3f}_delta_strong_{delta_strong_ratio:.2f}_z_{z:.2f}",
+            feat_dump,
+        )
+
     # 10. Micro-momentum bonus
     momentum_ok = indicators.micro_momentum_aligned(features.closes_1m, direction_up)
     feat_dump["micro_momentum_aligned"] = 1.0 if momentum_ok else 0.0

@@ -162,6 +162,13 @@ class Orchestrator:
             self._refresh_dashboard(market=market)
             return
 
+        if reentry_gate.get("entry_kind"):
+            decision_payload = {
+                **decision_payload,
+                "entry_kind": reentry_gate.get("entry_kind"),
+                "size_usd": reentry_gate.get("size_usd"),
+                "parent_trade_id": reentry_gate.get("parent_trade_id"),
+            }
         self._record_signal_observation(market, decision_payload)
         self._open_position(market, decision_payload)
 
@@ -400,8 +407,12 @@ class Orchestrator:
         side_ask = float(side_ask)
 
         size_usd = self.risk.size_position(confidence=confidence, side_ask=side_ask)
+        size_override = _optional_float(decision.get("size_usd"))
+        if size_override is not None and size_override > 0:
+            size_usd = min(size_usd, size_override) if size_usd > 0 else 0.0
         if size_usd <= 0:
             return
+        size_usd = round(size_usd, 2)
 
         result = self._submit_buy(token_id=token_id, notional_usd=size_usd, snapshot=book)
         if not result.success:
@@ -410,7 +421,12 @@ class Orchestrator:
 
         trade_id = f"trade-{uuid.uuid4().hex[:12]}"
         opened_ts = now_ts()
+        entry_kind = str(decision.get("entry_kind") or "main")
+        parent_trade_id = decision.get("parent_trade_id") if entry_kind == "addon" else None
         features = dict(decision.get("features") or {})
+        features["entry_kind"] = entry_kind
+        if parent_trade_id:
+            features["addon_parent_trade_id"] = str(parent_trade_id)
         features["regime_tags"] = regime_tags_from_features(features, self.cfg.signal)
         pos = OpenPosition(
             trade_id=trade_id,
@@ -423,6 +439,7 @@ class Orchestrator:
             market_slug=market.slug,
             opened_ts=opened_ts,
         )
+        pos.parent_trade_id = str(parent_trade_id) if parent_trade_id else None
         self.open_positions[trade_id] = pos
         self.risk.record_trade_open()
         self.journal.record_open(
@@ -432,14 +449,14 @@ class Orchestrator:
                 market_slug=market.slug,
                 side=side,
                 is_hedge=False,
-                parent_trade_id=None,
+                parent_trade_id=pos.parent_trade_id,
                 entry_ts=opened_ts,
                 entry_price=result.filled_price,
                 shares=result.filled_shares,
                 cost_usd=result.cost_usd,
                 confidence=confidence,
                 features=features,
-                extra={"order_id": result.order_id, "ts": iso_z()},
+                extra={"order_id": result.order_id, "ts": iso_z(), "entry_kind": entry_kind},
             )
         )
         self._record_entry_liquidity_analysis(
@@ -451,7 +468,8 @@ class Orchestrator:
             book=book,
         )
         logger.info(
-            "opened side=%s slug=%s shares=%.4f cost=%.2f confidence=%.3f",
+            "opened kind=%s side=%s slug=%s shares=%.4f cost=%.2f confidence=%.3f",
+            entry_kind,
             side,
             market.slug,
             result.filled_shares,
@@ -670,6 +688,8 @@ class Orchestrator:
         if not main_positions:
             return {"allowed": True, "reason": "ok"}
 
+        cfg = self.cfg.risk
+
         if not self.cfg.risk.allow_multiple_entries_per_market:
             return {"allowed": False, "reason": "position_already_open_for_market"}
 
@@ -691,7 +711,60 @@ class Orchestrator:
         if market_exposure >= max_exposure:
             return {"allowed": False, "reason": "max_market_exposure_hit"}
 
-        return {"allowed": True, "reason": "ok"}
+        if not cfg.addon_enabled:
+            return {"allowed": False, "reason": "addon_disabled"}
+
+        features = decision.get("features") or {}
+        if not isinstance(features, dict):
+            return {"allowed": False, "reason": "addon_missing_features"}
+
+        seconds_left = _feature_float(features, "seconds_left", market.seconds_left)
+        side_ask = _feature_float(features, "side_ask", 0.0)
+        delta_ratio = _feature_float(features, "delta_strong_ratio", 0.0)
+        abs_zscore = abs(_feature_float(features, "zscore", 0.0))
+        spread = _feature_float(features, "spread", 0.99)
+        top_ask_usd = _feature_float(features, "top_ask_notional_usd", 0.0)
+
+        if seconds_left < cfg.addon_min_seconds_left:
+            return {
+                "allowed": False,
+                "reason": f"addon_seconds_left_{seconds_left:.1f}_below_{cfg.addon_min_seconds_left:.1f}",
+            }
+        if side_ask < cfg.addon_min_side_ask:
+            return {
+                "allowed": False,
+                "reason": f"addon_side_ask_{side_ask:.3f}_below_{cfg.addon_min_side_ask:.2f}",
+            }
+        if delta_ratio < cfg.addon_min_delta_strong_ratio:
+            return {
+                "allowed": False,
+                "reason": f"addon_delta_ratio_{delta_ratio:.2f}_below_{cfg.addon_min_delta_strong_ratio:.2f}",
+            }
+        if abs_zscore < cfg.addon_min_abs_zscore:
+            return {
+                "allowed": False,
+                "reason": f"addon_abs_zscore_{abs_zscore:.2f}_below_{cfg.addon_min_abs_zscore:.2f}",
+            }
+        if spread > cfg.addon_max_spread:
+            return {"allowed": False, "reason": f"addon_spread_{spread:.3f}_too_wide"}
+
+        base_size = min(p.cost_usd for p in main_positions)
+        addon_size = round(min(cfg.addon_size_usd, base_size), 2)
+        if addon_size < cfg.min_position_usd:
+            return {"allowed": False, "reason": "addon_size_below_min_position"}
+        if top_ask_usd < addon_size:
+            return {"allowed": False, "reason": f"addon_top_ask_${top_ask_usd:.1f}_too_thin"}
+        if market_exposure + addon_size > max_exposure:
+            return {"allowed": False, "reason": "addon_market_exposure_hit"}
+
+        parent = min(main_positions, key=lambda p: p.opened_ts or 0.0)
+        return {
+            "allowed": True,
+            "reason": "ok_addon",
+            "entry_kind": "addon",
+            "size_usd": addon_size,
+            "parent_trade_id": parent.trade_id,
+        }
 
     def _settle_paper_position(self, trade_id: str) -> None:
         pos = self.open_positions.get(trade_id)
@@ -798,6 +871,13 @@ def _slug_bucket_start(slug: str) -> int | None:
     except (TypeError, ValueError):
         return None
 
+
+def _feature_float(features: dict, key: str, default: float) -> float:
+    try:
+        value = features.get(key, default)
+        return float(default if value is None else value)
+    except (TypeError, ValueError):
+        return float(default)
 
 def _optional_float(value) -> float | None:
     try:

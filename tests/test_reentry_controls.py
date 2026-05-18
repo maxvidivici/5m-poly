@@ -1,13 +1,14 @@
 from pathlib import Path
 
-from edge_bot.core.config import AppConfig, StorageConfig
+from edge_bot.core.config import AppConfig, RiskConfig, StorageConfig
 from edge_bot.core.orchestrator import OpenPosition, Orchestrator
 from edge_bot.data.polymarket import MarketSnapshot
 
 
-def make_orch(tmp_path: Path) -> Orchestrator:
+def make_orch(tmp_path: Path, risk: RiskConfig | None = None) -> Orchestrator:
     cfg = AppConfig(
         mode="paper",
+        risk=risk or RiskConfig(),
         storage=StorageConfig(
             runtime_dir=tmp_path,
             journal_db=tmp_path / "journal.sqlite3",
@@ -17,6 +18,33 @@ def make_orch(tmp_path: Path) -> Orchestrator:
     )
     return Orchestrator(cfg)
 
+
+def addon_risk(**overrides) -> RiskConfig:
+    values = {
+        "max_entries_per_market": 2,
+        "addon_enabled": True,
+        "addon_size_usd": 3.0,
+        "addon_min_seconds_left": 45.0,
+        "addon_min_side_ask": 0.82,
+        "addon_min_delta_strong_ratio": 1.0,
+        "addon_min_abs_zscore": 1.0,
+        "addon_max_spread": 0.02,
+    }
+    values.update(overrides)
+    return RiskConfig(**values)
+
+
+def addon_decision(**features):
+    base_features = {
+        "seconds_left": 90.0,
+        "side_ask": 0.84,
+        "delta_strong_ratio": 1.05,
+        "zscore": -1.2,
+        "spread": 0.01,
+        "top_ask_notional_usd": 50.0,
+    }
+    base_features.update(features)
+    return {"side": "UP", "features": base_features}
 
 def market() -> MarketSnapshot:
     return MarketSnapshot(
@@ -45,13 +73,16 @@ def pos(i: int, *, side: str = "UP", opened_ts: float = 0.0, cost: float = 2.0) 
     )
 
 
-def test_reentry_allowed_under_market_limits(tmp_path) -> None:
-    orch = make_orch(tmp_path)
-    orch.open_positions["t1"] = pos(1, opened_ts=0.0)
+def test_strict_addon_reentry_allowed_under_market_limits(tmp_path) -> None:
+    orch = make_orch(tmp_path, addon_risk())
+    orch.open_positions["t1"] = pos(1, opened_ts=0.0, cost=3.0)
 
-    gate = orch._can_open_for_market(market(), {"side": "UP"})
+    gate = orch._can_open_for_market(market(), addon_decision())
 
     assert gate["allowed"] is True
+    assert gate["entry_kind"] == "addon"
+    assert gate["size_usd"] == 3.0
+    assert gate["parent_trade_id"] == "t1"
 
 
 def test_reentry_blocks_fourth_entry(tmp_path) -> None:
@@ -84,3 +115,22 @@ def test_reentry_blocks_market_exposure_cap(tmp_path) -> None:
     assert gate["allowed"] is False
     assert gate["reason"] == "max_market_exposure_hit"
 
+
+def test_reentry_blocks_when_addon_disabled(tmp_path) -> None:
+    orch = make_orch(tmp_path, RiskConfig(max_entries_per_market=2, addon_enabled=False))
+    orch.open_positions["t1"] = pos(1, opened_ts=0.0)
+
+    gate = orch._can_open_for_market(market(), addon_decision())
+
+    assert gate["allowed"] is False
+    assert gate["reason"] == "addon_disabled"
+
+
+def test_reentry_blocks_weak_addon_signal(tmp_path) -> None:
+    orch = make_orch(tmp_path, addon_risk())
+    orch.open_positions["t1"] = pos(1, opened_ts=0.0)
+
+    gate = orch._can_open_for_market(market(), addon_decision(side_ask=0.81))
+
+    assert gate["allowed"] is False
+    assert gate["reason"].startswith("addon_side_ask_")

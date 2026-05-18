@@ -167,6 +167,167 @@ atr_pct_0.310_above_hard_0.300
 
 The initial threshold comes from observed results: visible overnight winners were below about `0.224%`, while the three official losses that triggered this rule were around `0.307-0.310%`.
 
+## Separate Scenario: Tail Reversal Probe
+
+This is not a hedge for an open main position. It is a separate shadow/paper scenario for rare, high-upside reversals when the main strategy wanted to enter one side but the entry was blocked by high-volatility or reversal-risk rules.
+
+Goal:
+
+```text
+Risk a small fixed amount on the cheap opposite side only when the payout is large enough to justify a low winrate.
+```
+
+Example:
+
+```text
+Main signal: DOWN
+Main entry: blocked by high volatility / reversal risk
+Opposite side: UP
+UP ask: 0.05-0.10
+Probe size: $1
+```
+
+The expected upside is approximately:
+
+```text
+ask 0.10 -> about 10x gross payout
+ask 0.05 -> about 20x gross payout
+ask 0.01 -> about 100x gross payout
+```
+
+Initial paper-only entry rules:
+
+```text
+main entry would otherwise pass core direction logic
+main entry is blocked by high_volatility / late_reversal_risk logic
+opposite_ask <= 0.10, or <= 0.12 during analysis only
+opposite_ask >= 0.01
+opposite spread <= 0.03
+opposite top ask liquidity >= $1
+only one probe per market
+fixed probe size = $1
+```
+
+Do not create a probe when the main entry was blocked by operational or bad-market-data reasons:
+
+```text
+missing_data
+no_asks_either_side
+spread_too_wide
+top_ask_too_thin
+too_late_to_enter
+API / resolution / stale-price errors
+```
+
+The probe also needs a physical reversal sanity check:
+
+```text
+distance_to_open_usd = abs(delta_usd)
+required_move_per_sec = distance_to_open_usd / seconds_left
+```
+
+Skip the probe if the required move back through the open line is unrealistic for the remaining time.
+
+Track probes separately from main strategy and hedge results:
+
+```text
+probe_side
+probe_ask
+probe_size_usd
+estimated_shares
+pnl_if_won
+pnl_if_lost
+atr_pct
+delta_usd
+seconds_left
+block_reason
+official_winning_side
+official_probe_pnl
+```
+
+Reports must show probe PnL separately by:
+
+```text
+opposite ask bucket: <0.03 / 0.03-0.05 / 0.05-0.10 / 0.10-0.12
+atr bucket
+seconds_left bucket
+distance_to_open bucket
+main block reason
+```
+
+This scenario should remain shadow/paper until it has enough official-settled samples to prove positive expected value after fees.
+
+## Separate Scenario: Strong Add-On Entry
+
+This is not a return to unrestricted repeated entries. The base strategy should still allow only one normal main entry per market. A second entry is allowed only as a separate `ADD_ON` scenario when the first position is already open and the signal has become materially stronger.
+
+Initial test posture:
+
+```text
+MAX_ENTRIES_PER_MARKET=2
+normal main entries per market = 1
+second entry type = ADD_ON only
+ADD_ON remains shadow/paper until proven by official-settled samples
+```
+
+Candidate ADD_ON conditions:
+
+```text
+first main entry is already open
+first entry is not hedge
+ADD_ON side == first entry side
+seconds_left >= 45
+side_ask >= 0.82
+delta_strong_ratio >= 1.00
+abs(zscore) >= 1.00
+top_ask_notional_usd >= addon_size
+spread <= 0.02
+market exposure after ADD_ON <= configured cap
+addon_size <= base_size
+```
+
+Example sizing for paper analysis:
+
+```text
+base_size = $3
+addon_size = $2-$3 max
+```
+
+Purpose:
+
+```text
+Do not bring back weak repeated entries.
+Allow extra exposure only when the market moves further in the original direction and the signal quality is much stronger.
+Keep the add-on smaller than or equal to the base position.
+```
+
+Required historical/counterfactual report before enabling:
+
+```text
+how many ADD_ON candidates appeared
+ADD_ON wins/losses/PnL separately from base trades
+combined base + ADD_ON market PnL
+whether ADD_ON would have increased losses in losing markets
+side_ask bucket
+delta_strong_ratio bucket
+zscore bucket
+seconds_left bucket
+liquidity bucket
+```
+
+Do not enable ADD_ON from intuition or after one good trade. Review after at least `30-50` new official-settled base trades under the current filters.
+
+Initial SQL-style report should compare:
+
+```text
+base_only_pnl
+base_plus_addon_pnl
+addon_only_pnl
+markets_where_addon_won
+markets_where_addon_lost
+max_market_loss_with_addon
+```
+
 ## Live Readiness Checklist
 
 Do not enable real-money mode until all items are true:
