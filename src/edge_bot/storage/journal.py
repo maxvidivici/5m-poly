@@ -250,17 +250,31 @@ class TradeJournal:
         self,
         *,
         market_slug: str,
-        final_btc: float,
-        window_open_btc: float,
+        winning_side: str,
         settled_ts: float,
+        final_btc: float | None = None,
+        window_open_btc: float | None = None,
+        only_unsettled: bool = True,
     ) -> int:
-        winning_side = "UP" if final_btc >= window_open_btc else "DOWN"
+        where = "market_slug = ?"
+        params: list[Any] = [
+            settled_ts,
+            final_btc,
+            window_open_btc,
+            winning_side,
+            winning_side,
+            winning_side,
+            market_slug,
+        ]
+        if only_unsettled:
+            where += " AND settled_at IS NULL"
         with self._conn() as cx:
             cur = cx.execute(
-                """
+                f"""
                 UPDATE signal_observations
                 SET settled_at = ?,
                     final_btc = ?,
+                    window_open_btc = COALESCE(?, window_open_btc),
                     winning_side = ?,
                     hypothetical_won = CASE
                         WHEN side IS NULL THEN NULL
@@ -277,11 +291,64 @@ class TradeJournal:
                         )
                         ELSE -1.0
                     END
-                WHERE market_slug = ? AND settled_at IS NULL
+                WHERE {where}
                 """,
-                (settled_ts, final_btc, winning_side, winning_side, winning_side, market_slug),
+                tuple(params),
             )
             return int(cur.rowcount or 0)
+
+    def reconcile_trade_official(
+        self,
+        *,
+        trade_id: str,
+        winning_side: str,
+        reconciled_ts: float,
+        resolution_source: str = "polymarket_gamma",
+        raw_status: str = "",
+    ) -> dict[str, Any] | None:
+        with self._conn() as cx:
+            row = cx.execute("SELECT * FROM trades WHERE trade_id = ?", (trade_id,)).fetchone()
+            if row is None:
+                return None
+            rec = dict(row)
+            won = rec["side"] == winning_side
+            proceeds = round(float(rec["shares"]) if won else 0.0, 4)
+            pnl = proceeds - float(rec["cost_usd"])
+            exit_price = 1.0 if won else 0.0
+            close_reason = "official_settled_won" if won else "official_settled_lost"
+            try:
+                extra = json.loads(rec.get("extra_json") or "{}")
+                if not isinstance(extra, dict):
+                    extra = {"previous_extra": extra}
+            except Exception:
+                extra = {"previous_extra_json": rec.get("extra_json")}
+            extra["official_resolution"] = {
+                "winning_side": winning_side,
+                "resolution_source": resolution_source,
+                "raw_status": raw_status,
+                "reconciled_at": reconciled_ts,
+                "previous_close_reason": rec.get("close_reason"),
+                "previous_pnl_usd": rec.get("pnl_usd"),
+            }
+            exit_ts = rec.get("exit_ts") or reconciled_ts
+            cx.execute(
+                """
+                UPDATE trades
+                SET exit_ts = ?, exit_price = ?, proceeds_usd = ?,
+                    pnl_usd = ?, close_reason = ?, extra_json = ?
+                WHERE trade_id = ?
+                """,
+                (
+                    exit_ts,
+                    exit_price,
+                    proceeds,
+                    pnl,
+                    close_reason,
+                    json.dumps(extra, default=str),
+                    trade_id,
+                ),
+            )
+            return {**rec, "new_pnl_usd": pnl, "new_close_reason": close_reason, "winning_side": winning_side}
 
     def signal_summary(self, *, since_ts: float | None = None) -> dict[str, Any]:
         where = "1=1"
@@ -362,6 +429,26 @@ class TradeJournal:
                 GROUP BY market_slug
                 ORDER BY market_end_ts ASC
                 """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def signal_markets(self) -> list[dict[str, Any]]:
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT market_slug, MAX(market_end_ts) AS market_end_ts
+                FROM signal_observations
+                GROUP BY market_slug
+                ORDER BY market_end_ts ASC
+                """
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_trades_for_reconcile(self, *, mode: str = "paper") -> list[dict[str, Any]]:
+        with self._conn() as cx:
+            rows = cx.execute(
+                "SELECT * FROM trades WHERE mode = ? ORDER BY entry_ts ASC",
+                (mode,),
             ).fetchall()
         return [dict(r) for r in rows]
 

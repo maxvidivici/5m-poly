@@ -13,8 +13,10 @@ from rich.console import Console
 from .backtest.engine import fetch_btc_1m_klines, run_backtest, run_backtest_from_klines
 from .core.config import load_config
 from .core.orchestrator import Orchestrator
+from .data.polymarket import GammaClient
 from .notifications.telegram import TelegramReporter, build_status_report
 from .storage.journal import TradeJournal
+from .utils.clock import now_ts
 from .utils.logging import setup_logging
 
 app = typer.Typer(help="Polymarket BTC 5m Edge Bot")
@@ -85,6 +87,122 @@ def signal_report(
     console.print(f"\n[bold]Top {limit} profitable skipped observations:[/bold]")
     for row in journal.list_profitable_skipped_observations(limit=limit):
         console.print_json(json.dumps(row, default=str))
+
+
+@app.command("reconcile-official")
+def reconcile_official(
+    apply: bool = typer.Option(False, "--apply", help="Write official Polymarket outcomes into the journal"),
+    db: Path = typer.Option(None, "--db", help="Path to journal SQLite db"),
+    mode: str = typer.Option("paper", "--mode", help="Journal mode to reconcile"),
+    limit: int = typer.Option(0, "--limit", min=0, help="Limit number of trades; 0 means all"),
+) -> None:
+    """Recalculate paper trades and signal observations from official Polymarket outcomes."""
+    cfg = load_config()
+    db_path = db or cfg.storage.journal_db
+    if not db_path.exists():
+        console.print(f"[yellow]No journal at {db_path}[/yellow]")
+        raise typer.Exit(code=1)
+
+    journal = TradeJournal(db_path)
+    gamma = GammaClient(base_url=cfg.data.gamma_base_url)
+    trades = journal.list_trades_for_reconcile(mode=mode)
+    if limit > 0:
+        trades = trades[:limit]
+
+    resolution_cache: dict[str, object] = {}
+
+    def resolution_for(slug: str):
+        if slug not in resolution_cache:
+            resolution_cache[slug] = gamma.resolve_market_resolution(
+                slug,
+                required_resolution_source=cfg.data.required_resolution_source,
+            )
+        return resolution_cache[slug]
+
+    checked = 0
+    pending = 0
+    changed = 0
+    pnl_changed = 0
+    official_wins = 0
+    official_losses = 0
+    old_pnl = 0.0
+    official_pnl = 0.0
+    changed_rows: list[dict] = []
+    ts = now_ts()
+
+    for row in trades:
+        resolution = resolution_for(str(row["market_slug"]))
+        if resolution is None or not resolution.resolved or resolution.winning_side is None:
+            pending += 1
+            continue
+        checked += 1
+        won = row["side"] == resolution.winning_side
+        proceeds = round(float(row["shares"]) if won else 0.0, 4)
+        pnl = proceeds - float(row["cost_usd"])
+        old = float(row["pnl_usd"] or 0.0)
+        old_pnl += old
+        official_pnl += pnl
+        if won:
+            official_wins += 1
+        else:
+            official_losses += 1
+        pnl_differs = row.get("pnl_usd") is None or abs(pnl - old) > 1e-9
+        needs_official_mark = not str(row.get("close_reason") or "").startswith("official_")
+        if pnl_differs:
+            pnl_changed += 1
+        if pnl_differs or needs_official_mark:
+            changed += 1
+            if pnl_differs:
+                changed_rows.append(
+                {
+                    "id": row["id"],
+                    "trade_id": row["trade_id"],
+                    "market_slug": row["market_slug"],
+                    "side": row["side"],
+                    "official_winning_side": resolution.winning_side,
+                    "old_pnl": round(old, 4),
+                    "official_pnl": round(pnl, 4),
+                }
+                )
+            if apply:
+                journal.reconcile_trade_official(
+                    trade_id=str(row["trade_id"]),
+                    winning_side=str(resolution.winning_side),
+                    reconciled_ts=ts,
+                    resolution_source=str(resolution.resolution_source),
+                    raw_status=str(resolution.raw_status),
+                )
+
+    signal_markets = journal.signal_markets()
+    signal_updated = 0
+    if apply:
+        for row in signal_markets:
+            resolution = resolution_for(str(row["market_slug"]))
+            if resolution is None or not resolution.resolved or resolution.winning_side is None:
+                continue
+            signal_updated += journal.settle_signal_observations(
+                market_slug=str(row["market_slug"]),
+                winning_side=str(resolution.winning_side),
+                settled_ts=ts,
+                only_unsettled=False,
+            )
+
+    payload = {
+        "mode": mode,
+        "apply": apply,
+        "trades_checked": checked,
+        "pending_unresolved": pending,
+        "changed_trades": changed,
+        "pnl_changed_trades": pnl_changed,
+        "official_wins": official_wins,
+        "official_losses": official_losses,
+        "old_pnl_usd": round(old_pnl, 4),
+        "official_pnl_usd": round(official_pnl, 4),
+        "difference_usd": round(official_pnl - old_pnl, 4),
+        "signal_observations_updated": signal_updated,
+        "changed_sample": changed_rows[:30],
+    }
+    console.print_json(json.dumps(payload, default=str))
 
 
 @app.command()

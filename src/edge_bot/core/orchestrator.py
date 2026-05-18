@@ -343,22 +343,28 @@ class Orchestrator:
         if not self._observed_signal_markets:
             return
         now = now_ts()
-        for slug, (end_ts, window_start) in list(self._observed_signal_markets.items()):
+        for slug, (end_ts, _window_start) in list(self._observed_signal_markets.items()):
             if slug in self._settled_signal_markets or now < end_ts:
                 continue
-            final_btc = self.price_feed.current_price()
-            window_open = self.price_feed.window_open_price(window_start)
-            if final_btc is None or window_open is None:
+            resolution = self.gamma.resolve_market_resolution(
+                slug,
+                required_resolution_source=self.cfg.data.required_resolution_source,
+            )
+            if resolution is None or not resolution.resolved or resolution.winning_side is None:
                 continue
             updated = self.journal.settle_signal_observations(
                 market_slug=slug,
-                final_btc=final_btc,
-                window_open_btc=window_open,
+                winning_side=resolution.winning_side,
                 settled_ts=now,
             )
             self._settled_signal_markets.add(slug)
             self._observed_signal_markets.pop(slug, None)
-            logger.info("signal_observations_settled slug=%s updated=%d", slug, updated)
+            logger.info(
+                "signal_observations_official_settled slug=%s side=%s updated=%d",
+                slug,
+                resolution.winning_side,
+                updated,
+            )
 
     def _load_unsettled_signal_markets(self) -> None:
         try:
@@ -595,14 +601,15 @@ class Orchestrator:
         pos = self.open_positions.get(trade_id)
         if pos is None:
             return
-        final_btc = self.price_feed.current_price()
-        window_start = _slug_bucket_start(pos.market_slug)
-        window_open = self.price_feed.window_open_price(window_start) if window_start is not None else None
-        if final_btc is None or window_open is None:
-            self._close_position(trade_id, reason="paper_settle_missing_resolution_data")
+        resolution = self.gamma.resolve_market_resolution(
+            pos.market_slug,
+            required_resolution_source=self.cfg.data.required_resolution_source,
+        )
+        if resolution is None or not resolution.resolved or resolution.winning_side is None:
+            logger.info("paper_settle_waiting_official_resolution trade_id=%s slug=%s", trade_id, pos.market_slug)
             return
 
-        winning_side = "UP" if final_btc >= window_open else "DOWN"
+        winning_side = resolution.winning_side
         won = pos.side == winning_side
         proceeds = round(pos.shares if won else 0.0, 4)
         pnl = proceeds - pos.cost_usd
@@ -614,20 +621,32 @@ class Orchestrator:
                 exit_price=exit_price,
                 proceeds_usd=proceeds,
                 pnl_usd=pnl,
-                close_reason="paper_settled_won" if won else "paper_settled_lost",
-                extra={"final_btc": final_btc, "window_open_btc": window_open, "winning_side": winning_side},
+                close_reason="official_settled_won" if won else "official_settled_lost",
+                extra={
+                    "winning_side": winning_side,
+                    "resolution_source": resolution.resolution_source,
+                    "raw_status": resolution.raw_status,
+                    "official_up_price": resolution.up_price,
+                    "official_down_price": resolution.down_price,
+                },
             )
         )
         self.risk.record_trade_close(pnl)
         del self.open_positions[trade_id]
-        logger.info("paper_settled trade_id=%s pnl=%.2f winning_side=%s", trade_id, pnl, winning_side)
+        logger.info("paper_official_settled trade_id=%s pnl=%.2f winning_side=%s", trade_id, pnl, winning_side)
 
     def _graceful_close_all(self) -> None:
         if not self.open_positions:
             return
         logger.warning("graceful_close_all n=%d", len(self.open_positions))
-        for trade_id in list(self.open_positions.keys()):
+        for trade_id, pos in list(self.open_positions.items()):
             try:
+                if isinstance(self.executor, PaperExecutor) and self.cfg.exit_.paper_settle_on_expiry:
+                    if now_ts() >= pos.market_end_ts:
+                        self._settle_paper_position(trade_id)
+                    else:
+                        logger.warning("paper_position_left_open_on_shutdown trade_id=%s", trade_id)
+                    continue
                 self._close_position(trade_id, reason="graceful_shutdown")
             except Exception as e:
                 logger.error("graceful_close_error trade_id=%s", trade_id, exc_info=e)

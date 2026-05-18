@@ -69,3 +69,24 @@ def test_summary_can_split_main_and_hedge_trades(tmp_path) -> None:
     assert hedge["total_pnl_usd"] == -0.7
     assert net["n_trades"] == 2
     assert net["total_pnl_usd"] == -0.2
+
+
+
+def test_reconcile_trade_official_overwrites_wrong_paper_settlement(tmp_path) -> None:
+    journal = TradeJournal(tmp_path / "journal.sqlite3")
+    journal.record_open(_open_trade("wrong", 100.0))
+    journal.record_close(CloseTradeRecord("wrong", 150.0, 1.0, 1.0, 0.3, "paper_settled_won"))
+
+    rec = journal.reconcile_trade_official(
+        trade_id="wrong",
+        winning_side="DOWN",
+        reconciled_ts=200.0,
+        resolution_source="polymarket_gamma",
+        raw_status="resolved",
+    )
+
+    assert rec is not None
+    summary = journal.summary()
+    assert summary["n_trades"] == 1
+    assert summary["losses"] == 1
+    assert summary["total_pnl_usd"] == -0.7

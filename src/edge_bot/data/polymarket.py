@@ -31,6 +31,17 @@ class MarketSnapshot:
 
 
 @dataclass(slots=True)
+class MarketResolution:
+    slug: str
+    resolved: bool
+    winning_side: str | None
+    resolution_source: str
+    raw_status: str
+    up_price: float | None = None
+    down_price: float | None = None
+
+
+@dataclass(slots=True)
 class OrderbookSnapshot:
     best_bid: float | None
     best_ask: float | None
@@ -57,6 +68,21 @@ def _source_matches(actual: str, required: str) -> bool:
     return bool(required_norm and required_norm in actual_norm)
 
 
+def _outcome_side_indices(outcomes: list[Any]) -> tuple[int, int]:
+    labels = [str(x).lower() for x in outcomes[:2]] if outcomes else []
+    up_i, down_i = 0, 1
+    if len(labels) >= 2 and ("up" in labels[1] or "yes" in labels[1]):
+        up_i, down_i = 1, 0
+    return up_i, down_i
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class GammaClient:
     def __init__(self, base_url: str = "https://gamma-api.polymarket.com", timeout: float = 8.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -74,6 +100,70 @@ class GammaClient:
         if not arr:
             return None
         return arr[0] if isinstance(arr, list) else None
+
+    def fetch_event_by_slug(self, slug: str) -> dict[str, Any] | None:
+        # Prefer the documented slug endpoint, then fall back to the list filter.
+        url = f"{self.base_url}/events/slug/{slug}"
+        try:
+            r = httpx.get(url, timeout=self.timeout, headers={"User-Agent": "edge-bot/0.1"})
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            logger.info("gamma_event_slug_error slug=%s", slug, exc_info=e)
+        return self.fetch_event(slug)
+
+    def resolve_market_resolution(
+        self,
+        slug: str,
+        *,
+        required_resolution_source: str | None = None,
+    ) -> MarketResolution | None:
+        ev = self.fetch_event_by_slug(slug)
+        if not ev:
+            return None
+        mkts = ev.get("markets") or []
+        if not mkts:
+            return None
+        m = mkts[0]
+        resolution_source = str(m.get("resolutionSource") or ev.get("resolutionSource") or "")
+        if required_resolution_source and not _source_matches(resolution_source, required_resolution_source):
+            logger.warning(
+                "market_resolution_source_mismatch slug=%s expected=%s actual=%s",
+                slug,
+                required_resolution_source,
+                resolution_source,
+            )
+            return None
+
+        outcomes = _parse_jsonish(m.get("outcomes") or [])
+        prices = _parse_jsonish(m.get("outcomePrices") or [])
+        if len(outcomes) < 2 or len(prices) < 2:
+            return MarketResolution(slug, False, None, resolution_source, str(m.get("umaResolutionStatus") or ""))
+
+        up_i, down_i = _outcome_side_indices(outcomes)
+        up_price = _to_float(prices[up_i])
+        down_price = _to_float(prices[down_i])
+        raw_status = str(m.get("umaResolutionStatus") or ev.get("umaResolutionStatus") or "")
+        closed = m.get("closed") is True or ev.get("closed") is True
+
+        winning_side: str | None = None
+        if up_price is not None and up_price >= 0.999:
+            winning_side = "UP"
+        elif down_price is not None and down_price >= 0.999:
+            winning_side = "DOWN"
+
+        resolved = bool(winning_side and (closed or raw_status.lower() == "resolved"))
+        return MarketResolution(
+            slug=slug,
+            resolved=resolved,
+            winning_side=winning_side if resolved else None,
+            resolution_source=resolution_source,
+            raw_status=raw_status,
+            up_price=up_price,
+            down_price=down_price,
+        )
 
     def resolve_current_btc_5m_market(
         self,
@@ -110,10 +200,7 @@ class GammaClient:
         if len(prices) < 2 or len(tokens) < 2:
             return None
 
-        labels = [str(x).lower() for x in outcomes[:2]] if outcomes else []
-        up_i, down_i = 0, 1
-        if len(labels) >= 2 and ("up" in labels[1] or "yes" in labels[1]):
-            up_i, down_i = 1, 0
+        up_i, down_i = _outcome_side_indices(outcomes)
 
         end_iso = str(m.get("endDate") or m.get("endDateIso") or "")
         try:
