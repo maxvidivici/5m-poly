@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from ..analysis.regime import regime_tags_from_features
 from ..dashboard.text import render_dashboard
 from ..data.polymarket import ClobClient, ClobWsObserver, ClobWsTop, GammaClient, MarketSnapshot, OrderbookLevel, OrderbookSnapshot
-from ..data.price_feed import PriceFeed
+from ..data.price_feed import Candle, PriceFeed
 from ..execution.fill_sim import simulate_buy_fill
 from ..execution.router import LiveExecutor, PaperExecutor, make_executor
 from ..hedge.engine import evaluate_hedge
@@ -311,6 +311,13 @@ class Orchestrator:
         )
 
         decision = evaluate(features, self.cfg.signal)
+        candle_features = _candle_reversal_features(
+            candles_1m,
+            current_btc=current_btc,
+            window_open=window_open,
+            direction_up=direction_up,
+            atr=decision.features.get("atr"),
+        )
         decision_features = {
             **decision.features,
             "current_btc": current_btc,
@@ -321,6 +328,7 @@ class Orchestrator:
             "up_bid": up_book.best_bid or 0.0,
             "down_bid": down_book.best_bid or 0.0,
             "top_ask_notional_usd": side_top_ask_notional_usd,
+            **candle_features,
             **ws_features,
         }
         return {
@@ -925,6 +933,78 @@ def _feature_float(features: dict, key: str, default: float) -> float:
         return float(default if value is None else value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _candle_reversal_features(
+    candles_1m: list[Candle],
+    *,
+    current_btc: float,
+    window_open: float,
+    direction_up: bool,
+    atr: object,
+) -> dict[str, float]:
+    data: dict[str, float] = {
+        "distance_from_open_usd": current_btc - window_open,
+        "abs_distance_from_open_usd": abs(current_btc - window_open),
+    }
+    atr_v = _optional_float(atr) or 0.0
+    data["distance_from_open_to_atr"] = abs(current_btc - window_open) / max(atr_v, 1e-6)
+
+    if not candles_1m:
+        return data
+
+    c = candles_1m[-1]
+    full_range = max(0.0, float(c.high) - float(c.low))
+    body = abs(float(c.close) - float(c.open))
+    upper_wick = max(0.0, float(c.high) - max(float(c.open), float(c.close)))
+    lower_wick = max(0.0, min(float(c.open), float(c.close)) - float(c.low))
+    data.update(
+        {
+            "last_1m_open": float(c.open),
+            "last_1m_high": float(c.high),
+            "last_1m_low": float(c.low),
+            "last_1m_close": float(c.close),
+            "last_1m_body_usd": body,
+            "last_1m_range_usd": full_range,
+            "last_1m_upper_wick_usd": upper_wick,
+            "last_1m_lower_wick_usd": lower_wick,
+            "last_1m_upper_wick_ratio": upper_wick / max(full_range, 1e-6),
+            "last_1m_lower_wick_ratio": lower_wick / max(full_range, 1e-6),
+            "last_1m_body_ratio": body / max(full_range, 1e-6),
+            "last_1m_direction": 1.0 if c.close >= c.open else -1.0,
+        }
+    )
+
+    if direction_up:
+        wick_against_side = upper_wick / max(full_range, 1e-6)
+        recovery_from_extreme = (float(c.high) - float(c.close)) / max(full_range, 1e-6)
+        side_close_reversed = 1.0 if c.close < c.open else 0.0
+    else:
+        wick_against_side = lower_wick / max(full_range, 1e-6)
+        recovery_from_extreme = (float(c.close) - float(c.low)) / max(full_range, 1e-6)
+        side_close_reversed = 1.0 if c.close > c.open else 0.0
+
+    data["wick_against_side_ratio"] = wick_against_side
+    data["recovery_from_side_extreme_ratio"] = max(0.0, recovery_from_extreme)
+    data["last_1m_close_against_side"] = side_close_reversed
+
+    if len(candles_1m) >= 2:
+        prev = candles_1m[-2]
+        close_change = float(c.close) - float(prev.close)
+        data["last_1m_close_change_usd"] = close_change
+        data["last_1m_close_change_against_side"] = (
+            1.0 if (direction_up and close_change < 0.0) or (not direction_up and close_change > 0.0) else 0.0
+        )
+
+    if len(candles_1m) >= 3:
+        recent = candles_1m[-3:]
+        if direction_up:
+            recovering = recent[-1].close < recent[-2].close < recent[-3].close
+        else:
+            recovering = recent[-1].close > recent[-2].close > recent[-3].close
+        data["three_close_recovery_against_side"] = 1.0 if recovering else 0.0
+
+    return data
 
 
 def _clob_ws_feature_dump(
