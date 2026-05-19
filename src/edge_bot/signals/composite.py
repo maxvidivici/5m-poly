@@ -147,11 +147,21 @@ def evaluate(features: FeatureSet, cfg: SignalConfig) -> CompositeDecision:
             feat_dump,
         )
 
-    # 7. Z-score soft score. Overheated moves reduce confidence instead of blocking.
+    # 7. Z-score guard. Extremely unusual moves often mean the entry is chasing
+    # a late spike; smaller overheats still only reduce confidence.
     z = indicators.zscore(features.historical_deltas_pct, current=delta_pct)
     zscore_score = _zscore_score(z, cfg)
     feat_dump["zscore"] = z
     feat_dump["zscore_score"] = zscore_score
+    feat_dump["zscore_hard_block_abs"] = cfg.zscore_hard_block_abs
+    if cfg.zscore_hard_block_enabled and abs(z) >= cfg.zscore_hard_block_abs:
+        return CompositeDecision(
+            False,
+            side_label,
+            0.0,
+            f"zscore_abs_{abs(z):.2f}_above_hard_{cfg.zscore_hard_block_abs:.2f}",
+            feat_dump,
+        )
 
     # 8. RSI soft bonus. Normal RSI helps; extreme RSI simply does not add score.
     rsi_v = indicators.rsi(features.closes_1m, period=14)

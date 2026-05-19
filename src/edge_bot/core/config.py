@@ -98,6 +98,8 @@ class SignalConfig:
     clob_ask_max: float = 0.95
     min_confidence: float = 0.62
     zscore_max: float = 2.5
+    zscore_hard_block_enabled: bool = True
+    zscore_hard_block_abs: float = 3.0
     atr_score_min_pct: float = 0.06
     atr_score_max_pct: float = 0.22
     atr_score_high_pct: float = 0.35
@@ -277,6 +279,8 @@ def load_config() -> AppConfig:
             clob_ask_max=_envf("CLOB_ASK_MAX", 0.95),
             min_confidence=_envf("MIN_CONFIDENCE", 0.62),
             zscore_max=_envf("ZSCORE_MAX", 2.5),
+            zscore_hard_block_enabled=_envb("ZSCORE_HARD_BLOCK_ENABLED", True),
+            zscore_hard_block_abs=_envf("ZSCORE_HARD_BLOCK_ABS", 3.0),
             atr_score_min_pct=_envf("ATR_SCORE_MIN_PCT", 0.06),
             atr_score_max_pct=_envf("ATR_SCORE_MAX_PCT", 0.22),
             atr_score_high_pct=_envf("ATR_SCORE_HIGH_PCT", 0.35),

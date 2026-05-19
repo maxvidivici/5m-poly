@@ -66,12 +66,22 @@ def test_skip_when_spread_too_wide() -> None:
 
 def test_zscore_overheat_is_soft_confidence_penalty() -> None:
     bad_hist = (0.0,) * 8 + (0.001,) * 4
-    d = evaluate(baseline_features(historical_deltas_pct=bad_hist), cfg())
-    clean = evaluate(baseline_features(), cfg())
+    soft_cfg = SignalConfig(zscore_hard_block_enabled=False)
+    d = evaluate(baseline_features(historical_deltas_pct=bad_hist), soft_cfg)
+    clean = evaluate(baseline_features(), soft_cfg)
 
     assert d.features["zscore_score"] < clean.features["zscore_score"]
     assert "zscore" not in d.reason
 
+
+def test_zscore_hard_block_rejects_extreme_overheat() -> None:
+    bad_hist = (0.0,) * 8 + (0.001,) * 4
+
+    d = evaluate(baseline_features(historical_deltas_pct=bad_hist), cfg())
+
+    assert d.enter is False
+    assert d.features["zscore_hard_block_abs"] == cfg().zscore_hard_block_abs
+    assert "zscore_abs" in d.reason
 
 
 def test_rsi_extreme_is_soft_bonus_not_hard_block() -> None:
@@ -153,7 +163,7 @@ def test_high_vol_edge_guard_allows_significant_zscore_move() -> None:
         seconds_left=92.0,
     )
 
-    d = evaluate(feats, cfg())
+    d = evaluate(feats, SignalConfig(zscore_hard_block_enabled=False))
 
     assert d.enter is True
     assert d.features["atr_pct"] >= cfg().high_vol_edge_guard_atr_pct
