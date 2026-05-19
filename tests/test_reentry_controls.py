@@ -146,7 +146,7 @@ def test_first_main_blocks_borderline_weak_signal(tmp_path) -> None:
 
     gate = orch._can_open_for_market(
         market(),
-        addon_decision(side_ask=0.71, delta_strong_ratio=0.59),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.59, zscore=1.20),
     )
 
     assert gate["allowed"] is False
@@ -165,13 +165,25 @@ def test_first_main_allows_borderline_signal_with_enough_delta_ratio(tmp_path) -
     assert gate["reason"] == "ok"
 
 
+def test_first_main_allows_borderline_signal_with_low_abs_zscore(tmp_path) -> None:
+    orch = make_orch(tmp_path)
+
+    gate = orch._can_open_for_market(
+        market(),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.53, zscore=0.15),
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == "ok"
+
+
 def test_borderline_weak_main_guard_does_not_replace_addon_rules(tmp_path) -> None:
     orch = make_orch(tmp_path, addon_risk())
     orch.open_positions["t1"] = pos(1, opened_ts=0.0)
 
     gate = orch._can_open_for_market(
         market(),
-        addon_decision(side_ask=0.71, delta_strong_ratio=0.59),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.59, zscore=1.20),
     )
 
     assert gate["allowed"] is False

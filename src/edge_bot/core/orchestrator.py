@@ -798,15 +798,18 @@ class Orchestrator:
 
         side_ask = _feature_float(features, "side_ask", 1.0)
         delta_ratio = _feature_float(features, "delta_strong_ratio", 1.0)
+        abs_zscore = abs(_feature_float(features, "zscore", 0.0))
         if (
             side_ask <= cfg.borderline_weak_main_max_side_ask
             and delta_ratio < cfg.borderline_weak_main_min_delta_strong_ratio
+            and abs_zscore >= cfg.borderline_weak_main_min_abs_zscore
         ):
             return {
                 "allowed": False,
                 "reason": "borderline_weak_main_"
                 f"side_ask_{side_ask:.3f}_lte_{cfg.borderline_weak_main_max_side_ask:.2f}_"
-                f"delta_ratio_{delta_ratio:.2f}_below_{cfg.borderline_weak_main_min_delta_strong_ratio:.2f}",
+                f"delta_ratio_{delta_ratio:.2f}_below_{cfg.borderline_weak_main_min_delta_strong_ratio:.2f}_"
+                f"abs_zscore_{abs_zscore:.2f}_gte_{cfg.borderline_weak_main_min_abs_zscore:.2f}",
             }
         return {"allowed": True, "reason": "ok"}
 

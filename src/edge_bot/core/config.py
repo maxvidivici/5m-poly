@@ -112,6 +112,7 @@ class SignalConfig:
     borderline_weak_main_guard_enabled: bool = True
     borderline_weak_main_max_side_ask: float = 0.71
     borderline_weak_main_min_delta_strong_ratio: float = 0.60
+    borderline_weak_main_min_abs_zscore: float = 1.00
     rsi_max: float = 78.0
     rsi_min: float = 22.0
     atr_overheat_mult: float = 1.6
@@ -299,6 +300,7 @@ def load_config() -> AppConfig:
                 "BORDERLINE_WEAK_MAIN_MIN_DELTA_STRONG_RATIO",
                 0.60,
             ),
+            borderline_weak_main_min_abs_zscore=_envf("BORDERLINE_WEAK_MAIN_MIN_ABS_ZSCORE", 1.00),
             rsi_max=_envf("RSI_MAX", 78.0),
             rsi_min=_envf("RSI_MIN", 22.0),
             atr_overheat_mult=_envf("ATR_OVERHEAT_MULT", 1.6),
