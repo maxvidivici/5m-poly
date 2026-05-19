@@ -1,13 +1,18 @@
 from pathlib import Path
 
-from edge_bot.core.config import AppConfig, RiskConfig, StorageConfig
+from edge_bot.core.config import AppConfig, RiskConfig, SignalConfig, StorageConfig
 from edge_bot.core.orchestrator import OpenPosition, Orchestrator
 from edge_bot.data.polymarket import MarketSnapshot
 
 
-def make_orch(tmp_path: Path, risk: RiskConfig | None = None) -> Orchestrator:
+def make_orch(
+    tmp_path: Path,
+    risk: RiskConfig | None = None,
+    signal: SignalConfig | None = None,
+) -> Orchestrator:
     cfg = AppConfig(
         mode="paper",
+        signal=signal or SignalConfig(),
         risk=risk or RiskConfig(),
         storage=StorageConfig(
             runtime_dir=tmp_path,
@@ -134,3 +139,52 @@ def test_reentry_blocks_weak_addon_signal(tmp_path) -> None:
 
     assert gate["allowed"] is False
     assert gate["reason"].startswith("addon_side_ask_")
+
+
+def test_first_main_blocks_borderline_weak_signal(tmp_path) -> None:
+    orch = make_orch(tmp_path)
+
+    gate = orch._can_open_for_market(
+        market(),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.59),
+    )
+
+    assert gate["allowed"] is False
+    assert str(gate["reason"]).startswith("borderline_weak_main_")
+
+
+def test_first_main_allows_borderline_signal_with_enough_delta_ratio(tmp_path) -> None:
+    orch = make_orch(tmp_path)
+
+    gate = orch._can_open_for_market(
+        market(),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.60),
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == "ok"
+
+
+def test_borderline_weak_main_guard_does_not_replace_addon_rules(tmp_path) -> None:
+    orch = make_orch(tmp_path, addon_risk())
+    orch.open_positions["t1"] = pos(1, opened_ts=0.0)
+
+    gate = orch._can_open_for_market(
+        market(),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.59),
+    )
+
+    assert gate["allowed"] is False
+    assert str(gate["reason"]).startswith("addon_side_ask_")
+
+
+def test_borderline_weak_main_guard_can_be_disabled(tmp_path) -> None:
+    orch = make_orch(tmp_path, signal=SignalConfig(borderline_weak_main_guard_enabled=False))
+
+    gate = orch._can_open_for_market(
+        market(),
+        addon_decision(side_ask=0.71, delta_strong_ratio=0.59),
+    )
+
+    assert gate["allowed"] is True
+    assert gate["reason"] == "ok"

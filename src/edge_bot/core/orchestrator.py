@@ -704,6 +704,9 @@ class Orchestrator:
             p for p in self.open_positions.values() if p.market_slug == market.slug and not p.is_hedge
         ]
         if not main_positions:
+            main_gate = self._borderline_weak_main_gate(decision)
+            if not main_gate["allowed"]:
+                return main_gate
             return {"allowed": True, "reason": "ok"}
 
         cfg = self.cfg.risk
@@ -783,6 +786,29 @@ class Orchestrator:
             "size_usd": addon_size,
             "parent_trade_id": parent.trade_id,
         }
+
+    def _borderline_weak_main_gate(self, decision: dict) -> dict[str, object]:
+        cfg = self.cfg.signal
+        if not cfg.borderline_weak_main_guard_enabled:
+            return {"allowed": True, "reason": "ok"}
+
+        features = decision.get("features") or {}
+        if not isinstance(features, dict):
+            return {"allowed": True, "reason": "ok"}
+
+        side_ask = _feature_float(features, "side_ask", 1.0)
+        delta_ratio = _feature_float(features, "delta_strong_ratio", 1.0)
+        if (
+            side_ask <= cfg.borderline_weak_main_max_side_ask
+            and delta_ratio < cfg.borderline_weak_main_min_delta_strong_ratio
+        ):
+            return {
+                "allowed": False,
+                "reason": "borderline_weak_main_"
+                f"side_ask_{side_ask:.3f}_lte_{cfg.borderline_weak_main_max_side_ask:.2f}_"
+                f"delta_ratio_{delta_ratio:.2f}_below_{cfg.borderline_weak_main_min_delta_strong_ratio:.2f}",
+            }
+        return {"allowed": True, "reason": "ok"}
 
     def _settle_paper_position(self, trade_id: str) -> None:
         pos = self.open_positions.get(trade_id)

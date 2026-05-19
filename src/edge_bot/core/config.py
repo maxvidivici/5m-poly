@@ -109,6 +109,9 @@ class SignalConfig:
     high_vol_edge_guard_atr_pct: float = 0.22
     high_vol_min_delta_strong_ratio: float = 0.80
     high_vol_min_abs_zscore: float = 0.50
+    borderline_weak_main_guard_enabled: bool = True
+    borderline_weak_main_max_side_ask: float = 0.71
+    borderline_weak_main_min_delta_strong_ratio: float = 0.60
     rsi_max: float = 78.0
     rsi_min: float = 22.0
     atr_overheat_mult: float = 1.6
@@ -290,6 +293,12 @@ def load_config() -> AppConfig:
             high_vol_edge_guard_atr_pct=_envf("HIGH_VOL_EDGE_GUARD_ATR_PCT", 0.22),
             high_vol_min_delta_strong_ratio=_envf("HIGH_VOL_MIN_DELTA_STRONG_RATIO", 0.80),
             high_vol_min_abs_zscore=_envf("HIGH_VOL_MIN_ABS_ZSCORE", 0.50),
+            borderline_weak_main_guard_enabled=_envb("BORDERLINE_WEAK_MAIN_GUARD_ENABLED", True),
+            borderline_weak_main_max_side_ask=_envf("BORDERLINE_WEAK_MAIN_MAX_SIDE_ASK", 0.71),
+            borderline_weak_main_min_delta_strong_ratio=_envf(
+                "BORDERLINE_WEAK_MAIN_MIN_DELTA_STRONG_RATIO",
+                0.60,
+            ),
             rsi_max=_envf("RSI_MAX", 78.0),
             rsi_min=_envf("RSI_MIN", 22.0),
             atr_overheat_mult=_envf("ATR_OVERHEAT_MULT", 1.6),
