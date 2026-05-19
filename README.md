@@ -67,6 +67,8 @@ python -m pytest -q
 
 See [TRADE_REVIEW_PLAYBOOK.md](TRADE_REVIEW_PLAYBOOK.md) for the required per-trade filter review checklist before changing strategy rules.
 
+See [STRATEGY_CHANGELOG.md](STRATEGY_CHANGELOG.md) for the strategy change log, active filters, observation-only additions, rejected ideas, and current baseline comparison setup.
+
 ## Live Preparation
 
 See [LIVE_READINESS.md](LIVE_READINESS.md) for the live-fill, liquidity-aware sizing, slippage and regime-analysis plan.
